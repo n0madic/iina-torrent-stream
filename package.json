@@ -1,0 +1,29 @@
+{
+  "name": "iina-torrent-stream",
+  "version": "0.1.0",
+  "description": "Stream torrents directly into IINA with seeking and buffering support",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "build": "rm -rf dist && parcel build"
+  },
+  "devDependencies": {
+    "iina-plugin-definition": "^0.99.0",
+    "parcel": "^2.12.0",
+    "prettier": "^3.2.5",
+    "typescript": "^5.4.5"
+  },
+  "targets": {
+    "main": false,
+    "entry": {
+      "distDir": "./dist/",
+      "source": "src/index.ts",
+      "isLibrary": false
+    },
+    "globalEntry": {
+      "distDir": "./dist/",
+      "source": "src/global.ts",
+      "isLibrary": false
+    }
+  }
+}

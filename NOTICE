@@ -1,0 +1,23 @@
+iina-torrent-stream
+Copyright (c) 2026 iina-torrent-stream contributors
+
+This product's own source code is licensed under the MIT License (see LICENSE).
+
+------------------------------------------------------------------------------
+Third-party components
+------------------------------------------------------------------------------
+
+The native `torrentd` companion daemon is a Go program that statically links
+the following libraries. Their source code is publicly available at the URLs
+below, satisfying the source-availability requirements of their licenses.
+
+  github.com/anacrolix/torrent          — Mozilla Public License 2.0
+  github.com/anacrolix/missinggo/v2     — Mozilla Public License 2.0
+  github.com/anacrolix/dht/v2           — Mozilla Public License 2.0
+  (and their transitive dependencies; see torrentd/go.sum)
+
+Mozilla Public License 2.0: https://www.mozilla.org/MPL/2.0/
+
+The `torrentd` binary is distributed in executable form as permitted by
+MPL-2.0 §3.2. Recipients may obtain the corresponding MPL-licensed source from
+the upstream repositories listed above.

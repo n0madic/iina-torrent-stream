@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Open Magnet Link</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+      }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+        font-size: 13px;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      /* IINA's standalone WKWebView paints an opaque white layer below the
+         DOM. The same workaround used by progress.html: a fixed-position
+         wrapper draws on top of that layer. */
+      .root {
+        position: fixed;
+        inset: 0;
+        padding: 16px 20px 14px;
+        background-color: #1c1c1e;
+        color: rgba(255, 255, 255, 0.95);
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      @media (prefers-color-scheme: light) {
+        .root {
+          background-color: #f5f5f7;
+          color: rgba(0, 0, 0, 0.88);
+        }
+      }
+      label {
+        font-size: 12px;
+        opacity: 0.7;
+      }
+      input[type="text"] {
+        font: inherit;
+        font-size: 12px;
+        padding: 7px 9px;
+        border-radius: 5px;
+        border: 1px solid rgba(127, 127, 127, 0.4);
+        background: rgba(255, 255, 255, 0.06);
+        color: inherit;
+        width: 100%;
+        user-select: text;
+        -webkit-user-select: text;
+        font-variant-numeric: tabular-nums;
+      }
+      @media (prefers-color-scheme: light) {
+        input[type="text"] {
+          background: rgba(0, 0, 0, 0.03);
+        }
+      }
+      input[type="text"]:focus {
+        outline: 2px solid #3478f6;
+        outline-offset: -1px;
+        border-color: transparent;
+      }
+      .buttons {
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+        margin-top: 2px;
+      }
+      button {
+        font: inherit;
+        font-size: 12px;
+        padding: 5px 14px;
+        min-width: 76px;
+        border-radius: 5px;
+        border: 1px solid rgba(127, 127, 127, 0.35);
+        background: rgba(127, 127, 127, 0.12);
+        color: inherit;
+        cursor: pointer;
+      }
+      button:hover {
+        background: rgba(127, 127, 127, 0.22);
+      }
+      button.primary {
+        background: #3478f6;
+        color: white;
+        border-color: #2a66d8;
+      }
+      button.primary:hover {
+        background: #4080f8;
+      }
+      button:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+      button.primary.dim {
+        background: rgba(52, 120, 246, 0.4);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="root">
+      <label for="src">Paste a magnet link or torrent URL:</label>
+      <input id="src" type="text" autocomplete="off" spellcheck="false" />
+      <div class="buttons">
+        <button id="cancel">Cancel</button>
+        <button id="open" class="primary">Open</button>
+      </div>
+    </div>
+
+    <script>
+      const input = document.getElementById("src");
+      const openBtn = document.getElementById("open");
+      const cancelBtn = document.getElementById("cancel");
+
+      function looksValid(s) {
+        const t = (s || "").trim();
+        if (!t) return false;
+        if (t.toLowerCase().startsWith("magnet:")) return true;
+        // http(s)://…/file.torrent  (allow ?query and #frag)
+        return /^https?:\/\/.+/i.test(t);
+      }
+
+      // Visual hint only — the button itself stays clickable. Disabling it
+      // produced a UX trap: a programmatic input.value = text (prefill) does
+      // not fire an input event, and a stale disabled state silently
+      // swallowed the click without any feedback or log.
+      function refreshHint() {
+        if (looksValid(input.value)) {
+          openBtn.classList.remove("dim");
+        } else {
+          openBtn.classList.add("dim");
+        }
+      }
+
+      function submit() {
+        const value = input.value.trim();
+        if (!value) return;
+        iina.postMessage("magnet-submit", value);
+      }
+
+      function cancel() {
+        iina.postMessage("magnet-cancel", null);
+      }
+
+      input.addEventListener("input", refreshHint);
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          submit();
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          cancel();
+        }
+      });
+      openBtn.addEventListener("click", submit);
+      cancelBtn.addEventListener("click", cancel);
+
+      // The plugin reads the clipboard on its side (utils.exec pbpaste) and
+      // pushes the result via "prefill" when it looks like a torrent link.
+      // Webview clipboard access is denied by IINA's WKWebView, so the round
+      // trip is the only practical way.
+      iina.onMessage("prefill", (text) => {
+        if (typeof text === "string" && text.length > 0) {
+          input.value = text;
+          input.select();
+          refreshHint();
+        }
+      });
+
+      refreshHint();
+      input.focus();
+      // Signal readiness so the plugin's prefill push doesn't race against
+      // the webview registering iina.onMessage.
+      iina.postMessage("magnet-ready", null);
+    </script>
+  </body>
+</html>

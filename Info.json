@@ -1,0 +1,26 @@
+{
+  "name": "Torrent Stream",
+  "identifier": "com.github.n0madic.iina-torrent-stream",
+  "version": "0.1.0",
+  "description": "Stream torrents directly into IINA with seeking and buffering, powered by a native companion engine.",
+  "ghRepo": "n0madic/iina-torrent-stream",
+  "author": {
+    "name": "n0madic",
+    "url": "https://github.com/n0madic/iina-torrent-stream"
+  },
+  "entry": "dist/index.js",
+  "globalEntry": "dist/global.js",
+  "permissions": ["show-alert", "file-system", "network-request"],
+  "allowedDomains": ["127.0.0.1", "localhost", "github.com"],
+  "preferencesPage": "pref.html",
+  "sidebarTab": {
+    "name": "Torrent"
+  },
+  "preferenceDefaults": {
+    "readaheadMiB": 512,
+    "seeding": true,
+    "autoShowSidebar": false,
+    "demuxerMaxBytesMiB": 256,
+    "debugEndpoints": false
+  }
+}

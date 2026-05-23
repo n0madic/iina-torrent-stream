@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Torrent Stream Preferences</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 16px;
+        font-size: 13px;
+        font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+      }
+      p {
+        margin: 0;
+      }
+      .pref-section {
+        margin-bottom: 16px;
+      }
+      .pref-help {
+        margin-top: 2px;
+        font-size: 11px;
+        opacity: 0.55;
+      }
+      input[type="number"] {
+        width: 6em;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="pref-section">
+      <label>
+        Read-ahead window:
+        <input type="number" data-pref-key="readaheadMiB" min="256" step="256" />
+        MiB
+      </label>
+      <p class="pref-help">
+        How much data the engine keeps queued ahead of the play cursor — a
+        larger window keeps more peers busy on a slow swarm. Clamped internally
+        to 256–2048 MiB. Does <em>not</em> cap on-disk usage; downloaded data
+        lives in a temporary folder that is removed when the engine stops.
+        Default: 512 MiB; raise it if playback stalls on a slow swarm.
+      </p>
+    </div>
+
+    <div class="pref-section">
+      <label>
+        In-player buffer:
+        <input type="number" data-pref-key="demuxerMaxBytesMiB" min="32" step="32" />
+        MiB
+      </label>
+      <p class="pref-help">
+        The mpv demuxer buffer (<code>demuxer-max-bytes</code>). Larger values
+        smooth playback over slow swarms at the cost of memory. Default: 256 MiB.
+      </p>
+    </div>
+
+    <div class="pref-section">
+      <label>
+        <input type="checkbox" data-type="bool" data-pref-key="seeding" />
+        Keep seeding while playing
+      </label>
+      <p class="pref-help">
+        Upload pieces back to the swarm while the engine is running. Disabling
+        this is less polite to the torrent community.
+      </p>
+    </div>
+
+    <div class="pref-section">
+      <label>
+        <input type="checkbox" data-type="bool" data-pref-key="autoShowSidebar" />
+        Show the Torrent sidebar automatically
+      </label>
+      <p class="pref-help">
+        Reveal the Torrent sidebar (download progress, peers, file list) when a
+        torrent starts playing.
+      </p>
+    </div>
+
+    <div class="pref-section">
+      <label>
+        <input type="checkbox" data-type="bool" data-pref-key="debugEndpoints" />
+        Enable diagnostic endpoints (for debugging)
+      </label>
+      <p class="pref-help">
+        Exposes <code>/debug/memstats</code> (live heap / goroutine /
+        torrent counts) and the standard Go <code>/debug/pprof/*</code>
+        profiler endpoints on the daemon's localhost HTTP server. Use to
+        diagnose memory or performance issues. Off by default. Restart IINA
+        after toggling — the daemon reads this flag at startup.
+      </p>
+    </div>
+  </body>
+</html>

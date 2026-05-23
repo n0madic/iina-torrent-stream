@@ -1,0 +1,84 @@
+name: Release
+
+# Builds and publishes a release whenever a version tag (v*) is pushed.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # macOS runner: needed for codesign and to match the target platform.
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: torrentd/go.mod
+          cache-dependency-path: torrentd/go.sum
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Compute version
+        id: ver
+        # GITHUB_REF_NAME is the tag (e.g. "v0.2.0"); we need both forms.
+        # The leading-"v" form goes into DAEMON_VERSION (used to construct
+        # the GitHub release URL); the bare semver goes into the binary's
+        # main.version (the plugin strips "v" before comparing).
+        run: |
+          set -euo pipefail
+          echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          echo "semver=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Run daemon tests
+        run: make test
+
+      - name: Build and sign the daemon binaries
+        env:
+          # Inject the BARE semver (no "v" prefix) into the binary so
+          # `torrentd --version` prints e.g. "0.2.0" — matching what
+          # the plugin's ensureBinary() expects after DAEMON_VERSION.replace(/^v/, "").
+          VERSION: ${{ steps.ver.outputs.semver }}
+        run: make daemon-release
+
+      - name: Inject release version and checksums into the plugin
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          SEMVER: ${{ steps.ver.outputs.semver }}
+        run: |
+          set -euo pipefail
+          SHA_ARM64=$(shasum -a 256 build/torrentd-darwin-arm64 | awk '{print $1}')
+          SHA_X86=$(shasum -a 256 build/torrentd-darwin-x86_64 | awk '{print $1}')
+          echo "Releasing $TAG (plugin version $SEMVER)"
+          echo "  torrentd-darwin-arm64  $SHA_ARM64"
+          echo "  torrentd-darwin-x86_64 $SHA_X86"
+          # Point the plugin at this release tag and pin the binary checksums.
+          sed -i '' \
+            -e "s|DAEMON_VERSION = \"[^\"]*\"|DAEMON_VERSION = \"${TAG}\"|" \
+            -e "s|arm64: \"[^\"]*\"|arm64: \"${SHA_ARM64}\"|" \
+            -e "s|x86_64: \"[^\"]*\"|x86_64: \"${SHA_X86}\"|" \
+            src/daemon.ts
+          sed -i '' "s|\"version\": \"[^\"]*\"|\"version\": \"${SEMVER}\"|" Info.json
+
+      - name: Build and package the plugin
+        run: make package
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/torrentd-darwin-arm64
+            build/torrentd-darwin-x86_64
+            iina-torrent-stream.iinaplgz
+          generate_release_notes: true
+          fail_on_unmatched_files: true

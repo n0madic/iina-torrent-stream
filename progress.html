@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Torrent Stream</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html, body {
+        margin: 0;
+        height: 100%;
+      }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+        font-size: 12px;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      /* IINA's standalone WKWebView has an opaque white background below the
+         document, so body/html background-color is hidden by it. A
+         position: fixed wrapper draws on top of that layer and covers the
+         whole viewport — this is the only way to get a non-white surface
+         in this kind of webview. */
+      .root {
+        position: fixed;
+        inset: 0;
+        padding: 14px 18px 16px;
+        background-color: #1c1c1e;
+        color: rgba(255, 255, 255, 0.95);
+      }
+      @media (prefers-color-scheme: light) {
+        .root {
+          background-color: #f5f5f7;
+          color: rgba(0, 0, 0, 0.88);
+        }
+      }
+      .header {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 8px;
+      }
+      .spinner {
+        width: 14px;
+        height: 14px;
+        flex: none;
+        border: 2px solid currentColor;
+        opacity: 1;
+        border-right-color: transparent;
+        border-bottom-color: transparent;
+        border-radius: 50%;
+        animation: spin 0.85s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      .status {
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 0.1px;
+      }
+      .name {
+        font-size: 12px;
+        opacity: 0.72;
+        line-height: 1.4;
+        word-break: break-all;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+        margin-bottom: 8px;
+      }
+      .stats {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px 10px;
+        font-size: 11px;
+        opacity: 0.85;
+        font-variant-numeric: tabular-nums;
+      }
+      .dot {
+        opacity: 0.4;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="root">
+      <div class="header">
+        <div class="spinner"></div>
+        <div class="status" id="status">Resolving torrent…</div>
+      </div>
+      <div class="name" id="name">—</div>
+      <div class="stats" id="stats"></div>
+    </div>
+
+    <script>
+      function fmtBytes(n) {
+        if (!n || n < 0) return "0 B";
+        const units = ["B", "KB", "MB", "GB"];
+        let i = 0;
+        let v = n;
+        while (v >= 1024 && i < units.length - 1) {
+          v /= 1024;
+          i++;
+        }
+        return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
+      }
+
+      function bestLabel(source) {
+        const dn = source.match(/[?&]dn=([^&]+)/);
+        if (dn) {
+          try {
+            return decodeURIComponent(dn[1].replace(/\+/g, " "));
+          } catch (e) {
+            /* fall through */
+          }
+        }
+        if (/^https?:\/\//i.test(source)) {
+          const tail = source.split(/[?#]/)[0].split("/").pop();
+          if (tail) return tail;
+        }
+        const tail = source.split("/").pop();
+        return tail || source;
+      }
+
+      function headline(status) {
+        if (!status) return "Resolving torrent…";
+        if (!status.files || status.files.length === 0) {
+          return status.peers > 0 ? "Fetching metadata…" : "Resolving torrent…";
+        }
+        if (status.downloadRate > 0) return "Buffering…";
+        return "Connecting to peers…";
+      }
+
+      function render({ source, status }) {
+        document.getElementById("status").textContent = headline(status);
+        document.getElementById("name").textContent = bestLabel(source);
+
+        const stats = document.getElementById("stats");
+        stats.textContent = "";
+        const parts = [];
+        if (status) {
+          if (status.downloadRate > 0) {
+            parts.push(`↓ ${fmtBytes(status.downloadRate)}/s`);
+          }
+          if (status.activePeers > 0 || status.peers > 0) {
+            const peers = status.activePeers > 0 ? status.activePeers : status.peers;
+            parts.push(`${peers} peer${peers === 1 ? "" : "s"}`);
+          }
+          // Show downloaded volume instead of "0%": for a large torrent the
+          // global progress percentage hardly budges in the time the HUD is
+          // visible (a few seconds to a minute), but the raw downloaded
+          // bytes is changing every tick — that's what tells the user
+          // something is actually happening.
+          if (status.bytesCompleted > 0) {
+            parts.push(fmtBytes(status.bytesCompleted));
+          }
+        }
+        parts.forEach((text, i) => {
+          if (i > 0) {
+            const dot = document.createElement("span");
+            dot.className = "dot";
+            dot.textContent = "·";
+            stats.appendChild(dot);
+          }
+          const span = document.createElement("span");
+          span.textContent = text;
+          stats.appendChild(span);
+        });
+      }
+
+      iina.onMessage("update", render);
+      // Ask the plugin to send the latest state now that our listener is
+      // registered. The plugin also push-updates every 400ms, so this is a
+      // best-effort fast-path rather than a required handshake — in
+      // practice this message often doesn't even reach the plugin before
+      // the push timer has already started.
+      iina.postMessage("requestUpdate");
+    </script>
+  </body>
+</html>

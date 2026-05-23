@@ -1,0 +1,7 @@
+node_modules/
+dist/
+build/
+.parcel-cache/
+*.iinaplgz
+.DS_Store
+torrentd/torrentd

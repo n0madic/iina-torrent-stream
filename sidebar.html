@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Torrent</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 12px;
+        font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+        font-size: 12px;
+        user-select: none;
+      }
+      .name {
+        font-weight: 600;
+        font-size: 13px;
+        margin-bottom: 8px;
+        word-break: break-word;
+      }
+      .bar {
+        height: 8px;
+        border-radius: 4px;
+        background: rgba(127, 127, 127, 0.25);
+        overflow: hidden;
+        margin-bottom: 6px;
+      }
+      .bar-fill {
+        height: 100%;
+        width: 0%;
+        background: #3478f6;
+        transition: width 0.4s ease;
+      }
+      .row {
+        display: flex;
+        justify-content: space-between;
+        margin: 2px 0;
+      }
+      .secondary {
+        opacity: 0.6;
+      }
+      .stats {
+        margin: 8px 0 12px;
+      }
+      .section-title {
+        text-transform: uppercase;
+        font-size: 10px;
+        letter-spacing: 0.06em;
+        opacity: 0.5;
+        margin: 12px 0 4px;
+      }
+      .file {
+        padding: 5px 6px;
+        border-radius: 5px;
+        margin-bottom: 2px;
+      }
+      .file.video {
+        cursor: pointer;
+      }
+      .file.video:hover {
+        background: rgba(127, 127, 127, 0.18);
+      }
+      .file-name {
+        word-break: break-word;
+      }
+      .file .meta {
+        font-size: 10px;
+        opacity: 0.55;
+      }
+      .placeholder {
+        opacity: 0.5;
+        text-align: center;
+        margin-top: 40px;
+      }
+      #content {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="placeholder" class="placeholder">No torrent is playing.</div>
+
+    <div id="content">
+      <div class="name" id="name">—</div>
+      <div class="bar"><div class="bar-fill" id="bar"></div></div>
+      <div class="row">
+        <span id="progress" class="secondary">0%</span>
+        <span id="completed" class="secondary">—</span>
+      </div>
+
+      <div class="stats">
+        <div class="row"><span>Download</span><span id="down">—</span></div>
+        <div class="row"><span>Upload</span><span id="up">—</span></div>
+        <div class="row"><span>Peers</span><span id="peers">—</span></div>
+        <div class="row"><span>Seeders</span><span id="seeders">—</span></div>
+      </div>
+
+      <div class="section-title">Files</div>
+      <div id="files"></div>
+    </div>
+
+    <script>
+      function fmtBytes(n) {
+        if (!n || n < 0) return "0 B";
+        const units = ["B", "KB", "MB", "GB", "TB"];
+        let i = 0;
+        let v = n;
+        while (v >= 1024 && i < units.length - 1) {
+          v /= 1024;
+          i++;
+        }
+        return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
+      }
+
+      function fmtRate(n) {
+        return `${fmtBytes(n)}/s`;
+      }
+
+      function el(id) {
+        return document.getElementById(id);
+      }
+
+      function render(s) {
+        el("placeholder").style.display = "none";
+        el("content").style.display = "block";
+
+        el("name").textContent = s.name || "—";
+        const pct = Math.round((s.progress || 0) * 100);
+        el("bar").style.width = `${pct}%`;
+        el("progress").textContent = `${pct}%`;
+        el("completed").textContent = `${fmtBytes(s.bytesCompleted)} / ${fmtBytes(s.length)}`;
+        el("down").textContent = fmtRate(s.downloadRate);
+        el("up").textContent = fmtRate(s.uploadRate);
+        el("peers").textContent = `${s.activePeers} active / ${s.peers} known`;
+        el("seeders").textContent = String(s.seeders);
+
+        const files = el("files");
+        files.textContent = "";
+        for (const f of s.files || []) {
+          const div = document.createElement("div");
+          div.className = f.isVideo ? "file video" : "file";
+
+          const name = document.createElement("div");
+          name.className = "file-name";
+          name.textContent = f.path.split("/").pop() || f.path;
+          div.appendChild(name);
+
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          const fpct = f.length > 0 ? Math.round((f.bytesCompleted / f.length) * 100) : 0;
+          meta.textContent = f.isVideo
+            ? `${fmtBytes(f.length)} · ${fpct}% · click to play`
+            : `${fmtBytes(f.length)} · ${f.mime}`;
+          div.appendChild(meta);
+
+          if (f.isVideo) {
+            div.addEventListener("click", () => iina.postMessage("switchFile", f.index));
+          }
+          files.appendChild(div);
+        }
+      }
+
+      iina.onMessage("status", render);
+      // Ask the plugin for the current state as soon as the sidebar is ready.
+      iina.postMessage("requestStatus", null);
+    </script>
+  </body>
+</html>
