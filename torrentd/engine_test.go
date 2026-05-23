@@ -184,6 +184,58 @@ func TestLoadRemoteMetainfo_RejectsNon200(t *testing.T) {
 	}
 }
 
+func TestNextVideoIndex(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		paths    []string
+		afterIdx int
+		want     int
+	}{
+		{
+			name:     "next video right after afterIdx",
+			paths:    []string{"a.mkv", "b.mkv", "c.mkv"},
+			afterIdx: 0,
+			want:     1,
+		},
+		{
+			name:     "skips non-video files between videos",
+			paths:    []string{"s01e01.mkv", "s01e01.srt", "readme.txt", "s01e02.mkv"},
+			afterIdx: 0,
+			want:     3,
+		},
+		{
+			name:     "no video after afterIdx",
+			paths:    []string{"s01e01.mkv", "s01e02.mkv"},
+			afterIdx: 1,
+			want:     -1,
+		},
+		{
+			name:     "afterIdx beyond list",
+			paths:    []string{"a.mkv"},
+			afterIdx: 5,
+			want:     -1,
+		},
+		{
+			name:     "afterIdx=-1 searches from start",
+			paths:    []string{"readme.txt", "s01e01.mkv"},
+			afterIdx: -1,
+			want:     1,
+		},
+		{
+			name:     "empty list",
+			paths:    nil,
+			afterIdx: 0,
+			want:     -1,
+		},
+	}
+	for _, c := range cases {
+		if got := nextVideoIndex(c.paths, c.afterIdx); got != c.want {
+			t.Errorf("%s: nextVideoIndex = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
 func TestSelectPrimaryIndex(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

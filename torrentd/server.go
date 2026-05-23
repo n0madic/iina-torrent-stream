@@ -40,6 +40,7 @@ func newServer(engine *Engine, lc *lifecycle, enableDebug bool) *server {
 	// from mpv trying to play a magnet: URL itself.
 	s.mux.HandleFunc("GET /play", s.handlePlay)
 	s.mux.HandleFunc("POST /torrents/{ih}/files/{idx}/prewarm", s.handlePrewarm)
+	s.mux.HandleFunc("POST /torrents/{ih}/warm-next", s.handleWarmNext)
 	s.mux.HandleFunc("POST /heartbeat", s.handleHeartbeat)
 	s.mux.HandleFunc("POST /shutdown", s.handleShutdown)
 
@@ -243,6 +244,29 @@ func (s *server) handlePrewarm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"path": path})
+}
+
+// handleWarmNext kicks off a background prewarm of the next video file in a
+// torrent after the given file index. The plugin calls this when playback of
+// the current episode crosses ~90 %, so when mpv switches playlist items the
+// next episode's head + tail are already on disk.
+func (s *server) handleWarmNext(w http.ResponseWriter, r *http.Request) {
+	s.lc.touch()
+	defer s.lc.touch()
+	after, err := strconv.Atoi(r.URL.Query().Get("after"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid or missing 'after' query parameter")
+		return
+	}
+	nextIdx, started, err := s.engine.WarmNext(r.PathValue("ih"), after)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"nextIndex": nextIdx,
+		"started":   started,
+	})
 }
 
 func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {

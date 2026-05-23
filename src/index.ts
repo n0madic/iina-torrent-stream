@@ -19,6 +19,7 @@ import {
   playURL,
   readDaemonState,
   addTorrent,
+  warmNext,
 } from "./daemon";
 import type { TorrentStatus } from "./daemon";
 import {
@@ -37,6 +38,16 @@ diag("index.ts main entry loaded");
 
 const HEARTBEAT_INTERVAL = 10_000;
 const STATUS_INTERVAL = 1_500;
+// Multi-video next-episode prewarm: the poller checks playback progress every
+// PROGRESS_POLL_INTERVAL_MS and triggers warmNext once percent-pos crosses
+// WARM_NEXT_THRESHOLD_PCT for the currently-playing file. A 5 s tick is
+// fine-grained enough to catch the threshold well before the file ends and
+// coarse enough not to add noticeable CPU/HTTP overhead.
+const PROGRESS_POLL_INTERVAL_MS = 5_000;
+const WARM_NEXT_THRESHOLD_PCT = 90;
+// Matches the daemon's /stream/{ih}/{idx}[/{name}] URL — used to extract the
+// currently-playing file index from mpv's "path" property.
+const STREAM_URL_FILE_IDX_RE = /\/stream\/[0-9a-f]+\/(\d+)(?:[\/?]|$)/i;
 // attachTracking initial-status retry schedule. Exponential so a transient
 // hiccup recovers fast, but a longer outage still gets ~5s of total budget.
 // Total ≈ 500 + 1000 + 2000 + 4000 + 8000 = 15.5s spread over 5 attempts.
@@ -48,12 +59,17 @@ interface ActiveTorrent {
   infohash: string;
   info: TorrentStatus;
   multiVideo: boolean;
+  /** File indexes for which warmNext has already been triggered this session.
+   * The daemon also de-duplicates via mt.warmedHead, but tracking it on the
+   * plugin side avoids the per-tick HTTP round-trip once a file has fired. */
+  warmedAfter: Set<number>;
 }
 
 let active: ActiveTorrent | null = null;
 let attaching = false;
 let heartbeatTimer: string | null = null;
 let statusTimer: string | null = null;
+let progressTimer: string | null = null;
 // Latched by iina.window-will-close. Used by attachTracking's deferred
 // onPluginQueue callback to refuse to start timers on a window that has
 // already closed — otherwise the timers would never be cleared and would
@@ -106,12 +122,22 @@ function clearTimers(): void {
     clearInterval(statusTimer);
     statusTimer = null;
   }
+  if (progressTimer) {
+    clearInterval(progressTimer);
+    progressTimer = null;
+  }
 }
 
 /** Starts the heartbeat and status-polling timers for an active torrent. */
 function startTracking(port: number, info: TorrentStatus, multiVideo: boolean): void {
   clearTimers();
-  active = { port, infohash: info.infohash, info, multiVideo };
+  active = {
+    port,
+    infohash: info.infohash,
+    info,
+    multiVideo,
+    warmedAfter: new Set<number>(),
+  };
   diag(`tracking started for ${info.name}`);
 
   heartbeatTimer = setInterval(() => {
@@ -130,6 +156,32 @@ function startTracking(port: number, info: TorrentStatus, multiVideo: boolean): 
       onPluginQueue(() => sidebar.postMessage("status", status));
     }
   }, STATUS_INTERVAL);
+
+  // Multi-video only: poll playback progress so we can ask the daemon to
+  // prewarm the next episode's head + tail once the current one is ~90 %
+  // played. Without this, switching playlist items always stalls in
+  // buffering — the next file's pieces have priority 0 until mpv opens it.
+  if (multiVideo) {
+    progressTimer = setInterval(() => watchProgress(), PROGRESS_POLL_INTERVAL_MS);
+  }
+}
+
+/** One tick of the multi-video progress watcher. Reads mpv's current file
+ * URL + percent-pos; once playback crosses WARM_NEXT_THRESHOLD_PCT for a
+ * file index not yet seen, fires a single warmNext for that index. */
+function watchProgress(): void {
+  if (!active) return;
+  const percent = mpv.getNumber("percent-pos");
+  if (!Number.isFinite(percent) || percent < WARM_NEXT_THRESHOLD_PCT) return;
+  const path = mpv.getString("path");
+  if (!path) return;
+  const match = STREAM_URL_FILE_IDX_RE.exec(path);
+  if (!match) return; // not a daemon /stream URL (e.g. transient /play URL)
+  const currentIdx = Number(match[1]);
+  if (!Number.isInteger(currentIdx) || active.warmedAfter.has(currentIdx)) return;
+  active.warmedAfter.add(currentIdx);
+  diag(`warm-next triggered after idx=${currentIdx} at ${percent.toFixed(1)}%`);
+  void warmNext(active.port, active.infohash, currentIdx);
 }
 
 /** Stops all tracking and clears the active-torrent state. */

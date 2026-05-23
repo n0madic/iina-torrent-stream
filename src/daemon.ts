@@ -462,6 +462,26 @@ export async function resumeTorrent(port: number, infohash: string): Promise<voi
   }
 }
 
+/** Asks the daemon to prewarm the head + tail of the next video file in a
+ * torrent (after the given index). Best-effort: errors are swallowed, since
+ * a missed warm-up only means the cross-episode transition falls back to the
+ * pre-existing "cold start" buffering, not a broken stream. */
+export async function warmNext(
+  port: number,
+  infohash: string,
+  afterIdx: number,
+): Promise<void> {
+  try {
+    await http.post(
+      `http://127.0.0.1:${port}/torrents/${infohash}/warm-next?after=${afterIdx}`,
+      {} as any,
+    );
+  } catch {
+    // Non-fatal: the worst case is a slightly slower transition to the next
+    // episode, identical to the pre-prewarm behaviour.
+  }
+}
+
 /**
  * Builds an all-in-one playback URL. mpv hits this single URL and the daemon
  * resolves the source, waits for metadata, and streams the primary video file

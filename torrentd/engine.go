@@ -32,6 +32,14 @@ const (
 	// tailWarmBytes is the size of the file tail fetched eagerly so containers
 	// that store their index at end-of-file start instantly.
 	tailWarmBytes = 4 << 20 // 4 MiB
+	// headWarmBytes is the size of the file head fetched eagerly during a
+	// next-episode prewarm. Sized to outlast the moment mpv switches playlist
+	// items so the swarm has time to reprioritise on the new file before mpv's
+	// cache-secs window empties. 128 MiB buys ~1.5-3.5 minutes of pre-buffered
+	// HD video — at the 90 %-played trigger that fits well inside the ~4
+	// minutes of an average remaining episode. Started at 32 MiB; that was
+	// too small and caused visible buffering shortly after the cut.
+	headWarmBytes = 128 << 20 // 128 MiB
 	// metadataTimeout bounds how long the background goroutine waits for a
 	// magnet's metadata before giving up and dropping the torrent. POST
 	// /torrents returns immediately (with just the infohash), so this timeout
@@ -135,9 +143,10 @@ type Engine struct {
 
 // managedTorrent holds per-torrent bookkeeping, including download-rate samples.
 type managedTorrent struct {
-	t       *torrent.Torrent
-	addedAt time.Time
-	warmed  map[int]bool // file indexes whose tail has already been warmed
+	t          *torrent.Torrent
+	addedAt    time.Time
+	warmed     map[int]bool // file indexes whose tail has already been warmed
+	warmedHead map[int]bool // file indexes whose head has already been warmed
 
 	// readers tracks the live streaming readers. gcLoop uses len(readers) > 0
 	// to decide whether a torrent is still in use; /debug/memstats sums the
@@ -275,6 +284,7 @@ func (e *Engine) Add(ctx context.Context, source string) (*managedTorrent, error
 		t:            t,
 		addedAt:      now,
 		warmed:       make(map[int]bool),
+		warmedHead:   make(map[int]bool),
 		lastSampleAt: now,
 		lastActiveAt: now,
 	}
@@ -621,24 +631,34 @@ func (e *Engine) Prewarm(ctx context.Context, ih string, idx int) (string, error
 	}
 }
 
-// warmTail eagerly fetches the tail of a file once, so containers that store
-// their index at end-of-file can begin playback without first downloading the
-// whole file sequentially.
-func (e *Engine) warmTail(mt *managedTorrent, idx int, f *torrent.File) {
+// warmRegion describes a contiguous byte range of a file to prewarm in the
+// background, plus the idempotency map that guards re-entry for that region
+// kind. The caller holds e.mu when reading/writing the flag map.
+type warmRegion struct {
+	name   string // "head" or "tail" — used only in failure logs
+	offset int64
+	length int64
+	flag   map[int]bool // mt.warmed (tail) or mt.warmedHead (head)
+}
+
+// warmRegionAsync schedules a one-shot background read of a file region so
+// the swarm prioritises those pieces. The reader is registered in mt.readers
+// for its lifetime so gcLoop will not evict the torrent mid-warm. Returns
+// true if a warm-up was actually scheduled, false if this region was already
+// warmed or in flight (de-duplicated via region.flag[idx]).
+func (e *Engine) warmRegionAsync(mt *managedTorrent, idx int, f *torrent.File, region warmRegion) bool {
 	e.mu.Lock()
-	if mt.warmed[idx] {
+	if region.flag[idx] {
 		e.mu.Unlock()
-		return
+		return false
 	}
-	mt.warmed[idx] = true
+	region.flag[idx] = true
 	e.mu.Unlock()
 
 	go func() {
 		tr := f.NewReader()
 		defer tr.Close()
 		tr.SetResponsive()
-		// Register the warm reader so gcLoop sees the torrent as in-use for
-		// as long as the tail prefetch is running.
 		e.mu.Lock()
 		mt.readers = append(mt.readers, tr)
 		tr.SetReadahead(e.readahead)
@@ -653,17 +673,87 @@ func (e *Engine) warmTail(mt *managedTorrent, idx int, f *torrent.File) {
 			}
 			e.mu.Unlock()
 		}()
-		start := max(f.Length()-tailWarmBytes, 0)
-		if _, err := tr.Seek(start, io.SeekStart); err != nil {
-			// Allow a retry on the next stream request — otherwise a
-			// transient seek failure leaves the file un-warmed forever.
-			e.mu.Lock()
-			delete(mt.warmed, idx)
-			e.mu.Unlock()
-			return
+		if region.offset > 0 {
+			if _, err := tr.Seek(region.offset, io.SeekStart); err != nil {
+				// Allow a retry on the next call — otherwise a transient
+				// seek failure leaves the region pinned as "warmed" forever.
+				e.mu.Lock()
+				delete(region.flag, idx)
+				e.mu.Unlock()
+				log.Printf("warm-%s: seek of file idx=%d failed: %v", region.name, idx, err)
+				return
+			}
 		}
-		_, _ = io.CopyN(io.Discard, tr, tailWarmBytes)
+		if _, err := io.CopyN(io.Discard, tr, region.length); err != nil {
+			e.mu.Lock()
+			delete(region.flag, idx)
+			e.mu.Unlock()
+			log.Printf("warm-%s: copy of file idx=%d failed: %v", region.name, idx, err)
+		}
 	}()
+	return true
+}
+
+// warmTail eagerly fetches the tail of a file once, so containers that store
+// their index at end-of-file can begin playback without first downloading the
+// whole file sequentially.
+func (e *Engine) warmTail(mt *managedTorrent, idx int, f *torrent.File) {
+	e.warmRegionAsync(mt, idx, f, warmRegion{
+		name:   "tail",
+		offset: max(f.Length()-tailWarmBytes, 0),
+		length: tailWarmBytes,
+		flag:   mt.warmed,
+	})
+}
+
+// WarmNext schedules a background prewarm of the next video file in the
+// torrent after afterIdx — its head (headWarmBytes) and tail (tailWarmBytes).
+// Returns the chosen file index and whether the head warm-up was actually
+// started (false if no next video file exists or its head was already
+// warmed). Triggered by the plugin once playback of the current episode
+// crosses ~90 %, so the next episode's first frames + container index are
+// ready when mpv switches playlist items.
+func (e *Engine) WarmNext(ih string, afterIdx int) (int, bool, error) {
+	mt := e.get(ih)
+	if mt == nil {
+		return -1, false, fmt.Errorf("torrent not found")
+	}
+	if mt.t.Info() == nil {
+		// No metadata yet — nothing to warm. Caller can retry once status
+		// reports a non-empty file list.
+		return -1, false, nil
+	}
+	files := mt.t.Files()
+	paths := make([]string, len(files))
+	for i, f := range files {
+		paths[i] = f.DisplayPath()
+	}
+	nextIdx := nextVideoIndex(paths, afterIdx)
+	if nextIdx < 0 {
+		return -1, false, nil
+	}
+	e.touch(ih)
+	f := files[nextIdx]
+	started := e.warmRegionAsync(mt, nextIdx, f, warmRegion{
+		name:   "head",
+		offset: 0,
+		length: min(f.Length(), headWarmBytes),
+		flag:   mt.warmedHead,
+	})
+	// Warm the tail too — mkv/mp4 carry the container index at end-of-file,
+	// so without it mpv would still stall on its first read. warmRegionAsync
+	// is idempotent on mt.warmed, so this is a no-op if Stream already
+	// warmed the tail for this file.
+	e.warmRegionAsync(mt, nextIdx, f, warmRegion{
+		name:   "tail",
+		offset: max(f.Length()-tailWarmBytes, 0),
+		length: tailWarmBytes,
+		flag:   mt.warmed,
+	})
+	if started {
+		log.Printf("warm-next: torrent %s file idx=%d (%s) scheduled", ih, nextIdx, f.DisplayPath())
+	}
+	return nextIdx, started, nil
 }
 
 // contextReader adapts a torrent.Reader to honour an HTTP request's context, so
@@ -888,6 +978,23 @@ func selectPrimaryIndex(files []fileMeta) int {
 		}
 	}
 	return best
+}
+
+// nextVideoIndex returns the index of the next video file strictly after
+// afterIdx, or -1 if none. Non-video files (subtitles, .txt, etc.) between
+// afterIdx and the next video are skipped. afterIdx may be -1 to search from
+// the beginning, and out-of-range values yield -1.
+func nextVideoIndex(paths []string, afterIdx int) int {
+	start := afterIdx + 1
+	if start < 0 {
+		start = 0
+	}
+	for i := start; i < len(paths); i++ {
+		if isVideoFile(paths[i]) {
+			return i
+		}
+	}
+	return -1
 }
 
 // videoMimes maps known video file extensions to their MIME types.
