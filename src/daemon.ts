@@ -462,23 +462,45 @@ export async function resumeTorrent(port: number, infohash: string): Promise<voi
   }
 }
 
+/** Response shape from POST /warm-next. `deferred=true` means the head warm
+ * was skipped because the active stream's buffer is too thin to safely spend
+ * bandwidth on a background fetch — the caller should retry on its next tick
+ * rather than mark this index as done. */
+export interface WarmNextResult {
+  nextIndex: number;
+  started: boolean;
+  deferred: boolean;
+}
+
 /** Asks the daemon to prewarm the head + tail of the next video file in a
- * torrent (after the given index). Best-effort: errors are swallowed, since
- * a missed warm-up only means the cross-episode transition falls back to the
- * pre-existing "cold start" buffering, not a broken stream. */
+ * torrent (after the given index). When `currentOffset` is supplied (mpv's
+ * stream-pos in the file at `afterIdx`), the daemon gates the 128 MiB head
+ * warm on the active stream's buffer health so it does not steal bandwidth
+ * from the file the user is watching. Errors return a deferred:false result
+ * so the caller does not retry indefinitely on a misconfigured daemon. */
 export async function warmNext(
   port: number,
   infohash: string,
   afterIdx: number,
-): Promise<void> {
+  currentOffset?: number,
+): Promise<WarmNextResult> {
+  let url = `http://127.0.0.1:${port}/torrents/${infohash}/warm-next?after=${afterIdx}`;
+  if (typeof currentOffset === "number" && currentOffset > 0) {
+    url += `&current_offset=${Math.floor(currentOffset)}`;
+  }
   try {
-    await http.post(
-      `http://127.0.0.1:${port}/torrents/${infohash}/warm-next?after=${afterIdx}`,
-      {} as any,
-    );
+    const res = await http.post(url, {} as any);
+    if (res.statusCode !== 200) {
+      return { nextIndex: -1, started: false, deferred: false };
+    }
+    const body = JSON.parse(res.text) as Partial<WarmNextResult>;
+    return {
+      nextIndex: typeof body.nextIndex === "number" ? body.nextIndex : -1,
+      started: body.started === true,
+      deferred: body.deferred === true,
+    };
   } catch {
-    // Non-fatal: the worst case is a slightly slower transition to the next
-    // episode, identical to the pre-prewarm behaviour.
+    return { nextIndex: -1, started: false, deferred: false };
   }
 }
 

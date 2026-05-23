@@ -55,8 +55,23 @@
         MiB
       </label>
       <p class="pref-help">
-        The mpv demuxer buffer (<code>demuxer-max-bytes</code>). Larger values
-        smooth playback over slow swarms at the cost of memory. Default: 256 MiB.
+        The mpv demuxer buffer (<code>demuxer-max-bytes</code>) used as the
+        starting value before the bitrate is known, and as the fixed value when
+        auto-tune below is disabled. Default: 256 MiB.
+      </p>
+    </div>
+
+    <div class="pref-section">
+      <label>
+        <input type="checkbox" data-type="bool" data-pref-key="demuxerMaxBytesAuto" />
+        Auto-tune the in-player buffer for stream bitrate
+      </label>
+      <p class="pref-help">
+        After the file's duration is known, resize the demuxer buffer to fit
+        ~30 s of the stream's actual bitrate (with VBR headroom), clamped to
+        64–1024 MiB. Low-bitrate streams use less RAM than the fixed value,
+        4K streams use more — so the buffer actually holds 30 s of data
+        instead of being truncated by the byte cap. On by default.
       </p>
     </div>
 

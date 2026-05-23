@@ -21,6 +21,7 @@
     "seeding": true,
     "autoShowSidebar": false,
     "demuxerMaxBytesMiB": 256,
+    "demuxerMaxBytesAuto": true,
     "debugEndpoints": false
   }
 }

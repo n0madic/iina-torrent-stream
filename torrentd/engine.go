@@ -440,13 +440,12 @@ func (e *Engine) Pause(ih string) bool {
 		return false
 	}
 	mt.lastActiveAt = time.Now()
-	log.Printf("paused torrent %s", ih)
 	return true
 }
 
 // Resume is the symmetric counterpart to Pause — the plugin calls it on
-// mpv's resume event. It only refreshes lastActiveAt and logs; the readahead
-// window was never lowered, so there is nothing to restore.
+// mpv's resume event. It only refreshes lastActiveAt; the readahead window
+// was never lowered, so there is nothing to restore.
 func (e *Engine) Resume(ih string) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -455,7 +454,6 @@ func (e *Engine) Resume(ih string) bool {
 		return false
 	}
 	mt.lastActiveAt = time.Now()
-	log.Printf("resumed torrent %s", ih)
 	return true
 }
 
@@ -655,43 +653,52 @@ func (e *Engine) warmRegionAsync(mt *managedTorrent, idx int, f *torrent.File, r
 	region.flag[idx] = true
 	e.mu.Unlock()
 
-	go func() {
-		tr := f.NewReader()
-		defer tr.Close()
-		tr.SetResponsive()
+	go e.runWarmReader(mt, f.NewReader(), region, idx)
+	return true
+}
+
+// runWarmReader executes the actual warm-up read against an already-built
+// torrent.Reader: registers it, applies a region-sized readahead, seeks, and
+// reads region.length bytes. Split out from warmRegionAsync so tests can
+// supply a fake reader.
+func (e *Engine) runWarmReader(mt *managedTorrent, tr torrent.Reader, region warmRegion, idx int) {
+	defer tr.Close()
+	tr.SetResponsive()
+	e.mu.Lock()
+	mt.readers = append(mt.readers, tr)
+	// Cap readahead at the region length. The full engine-wide readahead
+	// (often 512 MiB) here would mark hundreds of MB around the seek
+	// position as "wanted", stealing peer bandwidth from the active
+	// stream for data nobody reads.
+	tr.SetReadahead(region.length)
+	e.mu.Unlock()
+	defer func() {
 		e.mu.Lock()
-		mt.readers = append(mt.readers, tr)
-		tr.SetReadahead(e.readahead)
-		e.mu.Unlock()
-		defer func() {
-			e.mu.Lock()
-			for i, r := range mt.readers {
-				if r == tr {
-					mt.readers = append(mt.readers[:i], mt.readers[i+1:]...)
-					break
-				}
-			}
-			e.mu.Unlock()
-		}()
-		if region.offset > 0 {
-			if _, err := tr.Seek(region.offset, io.SeekStart); err != nil {
-				// Allow a retry on the next call — otherwise a transient
-				// seek failure leaves the region pinned as "warmed" forever.
-				e.mu.Lock()
-				delete(region.flag, idx)
-				e.mu.Unlock()
-				log.Printf("warm-%s: seek of file idx=%d failed: %v", region.name, idx, err)
-				return
+		for i, r := range mt.readers {
+			if r == tr {
+				mt.readers = append(mt.readers[:i], mt.readers[i+1:]...)
+				break
 			}
 		}
-		if _, err := io.CopyN(io.Discard, tr, region.length); err != nil {
+		e.mu.Unlock()
+	}()
+	if region.offset > 0 {
+		if _, err := tr.Seek(region.offset, io.SeekStart); err != nil {
+			// Allow a retry on the next call — otherwise a transient
+			// seek failure leaves the region pinned as "warmed" forever.
 			e.mu.Lock()
 			delete(region.flag, idx)
 			e.mu.Unlock()
-			log.Printf("warm-%s: copy of file idx=%d failed: %v", region.name, idx, err)
+			log.Printf("warm-%s: seek of file idx=%d failed: %v", region.name, idx, err)
+			return
 		}
-	}()
-	return true
+	}
+	if _, err := io.CopyN(io.Discard, tr, region.length); err != nil {
+		e.mu.Lock()
+		delete(region.flag, idx)
+		e.mu.Unlock()
+		log.Printf("warm-%s: copy of file idx=%d failed: %v", region.name, idx, err)
+	}
 }
 
 // warmTail eagerly fetches the tail of a file once, so containers that store
@@ -706,22 +713,36 @@ func (e *Engine) warmTail(mt *managedTorrent, idx int, f *torrent.File) {
 	})
 }
 
+// warmNextHealthThreshold is the minimum contiguous bytes ahead of the
+// active reader required to permit a 128 MiB next-episode head warm. Below
+// this, the head warm is deferred to avoid stealing bandwidth from the
+// currently-playing file when the network is unable to keep up. 32 MiB ≈
+// 25 s of HD video at 10 Mbps — long enough to ride out a brief request
+// burst without bleeding the active stream's lookahead dry.
+const warmNextHealthThreshold = 32 << 20
+
 // WarmNext schedules a background prewarm of the next video file in the
 // torrent after afterIdx — its head (headWarmBytes) and tail (tailWarmBytes).
-// Returns the chosen file index and whether the head warm-up was actually
-// started (false if no next video file exists or its head was already
-// warmed). Triggered by the plugin once playback of the current episode
-// crosses ~90 %, so the next episode's first frames + container index are
-// ready when mpv switches playlist items.
-func (e *Engine) WarmNext(ih string, afterIdx int) (int, bool, error) {
+// Returns the chosen file index, whether the head warm-up was actually
+// started, and whether it was deferred for bandwidth reasons (callers should
+// retry on a deferred result). Triggered by the plugin once playback of the
+// current episode crosses ~90 %, so the next episode's first frames +
+// container index are ready when mpv switches playlist items.
+//
+// currentOffset is the byte position of the active reader inside the file at
+// afterIdx, as reported by the plugin from mpv's stream-pos. When > 0 the
+// head warm is gated on contiguousBytesAhead being healthy enough that the
+// extra ~128 MiB of background traffic won't starve the active stream. Pass
+// 0 to bypass the gate (legacy behavior).
+func (e *Engine) WarmNext(ih string, afterIdx int, currentOffset int64) (int, bool, bool, error) {
 	mt := e.get(ih)
 	if mt == nil {
-		return -1, false, fmt.Errorf("torrent not found")
+		return -1, false, false, fmt.Errorf("torrent not found")
 	}
 	if mt.t.Info() == nil {
 		// No metadata yet — nothing to warm. Caller can retry once status
 		// reports a non-empty file list.
-		return -1, false, nil
+		return -1, false, false, nil
 	}
 	files := mt.t.Files()
 	paths := make([]string, len(files))
@@ -730,30 +751,108 @@ func (e *Engine) WarmNext(ih string, afterIdx int) (int, bool, error) {
 	}
 	nextIdx := nextVideoIndex(paths, afterIdx)
 	if nextIdx < 0 {
-		return -1, false, nil
+		return -1, false, false, nil
 	}
 	e.touch(ih)
 	f := files[nextIdx]
-	started := e.warmRegionAsync(mt, nextIdx, f, warmRegion{
-		name:   "head",
-		offset: 0,
-		length: min(f.Length(), headWarmBytes),
-		flag:   mt.warmedHead,
-	})
-	// Warm the tail too — mkv/mp4 carry the container index at end-of-file,
-	// so without it mpv would still stall on its first read. warmRegionAsync
-	// is idempotent on mt.warmed, so this is a no-op if Stream already
-	// warmed the tail for this file.
+
+	// Always warm the tail (4 MiB) first — it's cheap and carries the
+	// container index for mkv/mp4, without which mpv stalls on its first
+	// read when it switches to the next file. warmRegionAsync is idempotent
+	// on mt.warmed, so this is a no-op if Stream already warmed it.
 	e.warmRegionAsync(mt, nextIdx, f, warmRegion{
 		name:   "tail",
 		offset: max(f.Length()-tailWarmBytes, 0),
 		length: tailWarmBytes,
 		flag:   mt.warmed,
 	})
+
+	// Gate the 128 MiB head warm on the active stream's buffer health. When
+	// the current file at afterIdx has less than warmNextHealthThreshold
+	// bytes of contiguous data ahead of the play cursor, starting another
+	// large background fetch would steal bandwidth from the file the user is
+	// actually watching. Defer; the plugin polls every 5 s and will retry.
+	if currentOffset > 0 && afterIdx >= 0 && afterIdx < len(files) {
+		ahead := contiguousBytesAhead(mt.t, afterIdx, currentOffset)
+		if ahead < warmNextHealthThreshold {
+			log.Printf("warm-next: torrent %s deferred (current idx=%d offset=%d contiguous_ahead=%d < %d)",
+				ih, afterIdx, currentOffset, ahead, warmNextHealthThreshold)
+			return nextIdx, false, true, nil
+		}
+	}
+
+	started := e.warmRegionAsync(mt, nextIdx, f, warmRegion{
+		name:   "head",
+		offset: 0,
+		length: min(f.Length(), headWarmBytes),
+		flag:   mt.warmedHead,
+	})
 	if started {
 		log.Printf("warm-next: torrent %s file idx=%d (%s) scheduled", ih, nextIdx, f.DisplayPath())
 	}
-	return nextIdx, started, nil
+	return nextIdx, started, false, nil
+}
+
+// contiguousBytesAhead reports how many bytes are immediately readable from a
+// file starting at fromOffset — that is, the size of the contiguous prefix of
+// completed pieces beginning at the piece that contains fromOffset. Returns 0
+// when the piece containing fromOffset is not yet complete, when metadata is
+// missing, or when fromOffset is out of range. Used by WarmNext to gate the
+// next-episode head-warm, and by future buffer-ahead diagnostics.
+func contiguousBytesAhead(t *torrent.Torrent, fileIdx int, fromOffset int64) int64 {
+	info := t.Info()
+	if info == nil {
+		return 0
+	}
+	files := t.Files()
+	if fileIdx < 0 || fileIdx >= len(files) {
+		return 0
+	}
+	f := files[fileIdx]
+	return contiguousBytesAheadCore(
+		info.PieceLength,
+		f.Offset(),
+		f.Length(),
+		fromOffset,
+		t.NumPieces(),
+		func(pi int) bool { return t.PieceState(pi).Complete },
+	)
+}
+
+// contiguousBytesAheadCore is the pure-logic implementation of
+// contiguousBytesAhead, kept separate so it can be unit-tested without
+// standing up an anacrolix client. isComplete reports whether a piece by
+// index is fully downloaded and verified.
+func contiguousBytesAheadCore(
+	pieceLen, fileOffset, fileLength, fromOffset int64,
+	numPieces int,
+	isComplete func(pieceIdx int) bool,
+) int64 {
+	if pieceLen <= 0 || fileLength <= 0 || fromOffset < 0 || fromOffset >= fileLength {
+		return 0
+	}
+	absStart := fileOffset + fromOffset
+	fileEnd := fileOffset + fileLength
+	startPiece := int(absStart / pieceLen)
+
+	lastCompleteEnd := absStart
+	for pi := startPiece; pi < numPieces; pi++ {
+		if !isComplete(pi) {
+			break
+		}
+		pieceEnd := int64(pi+1) * pieceLen
+		lastCompleteEnd = pieceEnd
+		if pieceEnd >= fileEnd {
+			break
+		}
+	}
+	if lastCompleteEnd > fileEnd {
+		lastCompleteEnd = fileEnd
+	}
+	if lastCompleteEnd <= absStart {
+		return 0
+	}
+	return lastCompleteEnd - absStart
 }
 
 // contextReader adapts a torrent.Reader to honour an HTTP request's context, so

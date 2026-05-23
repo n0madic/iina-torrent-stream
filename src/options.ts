@@ -33,9 +33,18 @@ export const opt = {
   get autoShowSidebar(): boolean {
     return readBool("autoShowSidebar", false);
   },
-  /** mpv `demuxer-max-bytes` value, in MiB — the in-player buffer size. */
+  /** mpv `demuxer-max-bytes` value, in MiB — the in-player buffer size.
+   * Used as the starting value before duration is known, and as the final
+   * value when auto-tune is off. */
   get demuxerMaxBytesMiB(): number {
     return readInt("demuxerMaxBytesMiB", 256);
+  },
+  /** When true, resize demuxer-max-bytes to match the stream's actual
+   * bitrate × cache-secs once mpv reports a duration — so the byte cap
+   * does not silently truncate the cache-secs buffer on high-bitrate
+   * content (e.g. 4K), and low-bitrate content does not over-allocate. */
+  get demuxerMaxBytesAuto(): boolean {
+    return readBool("demuxerMaxBytesAuto", true);
   },
   /** Whether to expose /debug/memstats and /debug/pprof/* on the daemon's
    * HTTP server. Off by default. Requires restarting IINA after toggling

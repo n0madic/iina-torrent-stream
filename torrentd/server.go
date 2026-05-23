@@ -250,6 +250,11 @@ func (s *server) handlePrewarm(w http.ResponseWriter, r *http.Request) {
 // torrent after the given file index. The plugin calls this when playback of
 // the current episode crosses ~90 %, so when mpv switches playlist items the
 // next episode's head + tail are already on disk.
+//
+// Optional current_offset (bytes into the file at `after`, from mpv's
+// stream-pos) enables a bandwidth-health gate: when the active stream's
+// contiguous buffer is small, the 128 MiB head warm is deferred and the
+// plugin is expected to retry on its next 5 s tick.
 func (s *server) handleWarmNext(w http.ResponseWriter, r *http.Request) {
 	s.lc.touch()
 	defer s.lc.touch()
@@ -258,7 +263,13 @@ func (s *server) handleWarmNext(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid or missing 'after' query parameter")
 		return
 	}
-	nextIdx, started, err := s.engine.WarmNext(r.PathValue("ih"), after)
+	var currentOffset int64
+	if raw := r.URL.Query().Get("current_offset"); raw != "" {
+		if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v >= 0 {
+			currentOffset = v
+		}
+	}
+	nextIdx, started, deferred, err := s.engine.WarmNext(r.PathValue("ih"), after, currentOffset)
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
@@ -266,6 +277,7 @@ func (s *server) handleWarmNext(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"nextIndex": nextIdx,
 		"started":   started,
+		"deferred":  deferred,
 	})
 }
 

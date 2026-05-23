@@ -94,13 +94,86 @@ let sidebarRevealed = false;
 // set — IINA's player window is an NSWindow wrapper around MPVView that
 // ignores that mpv option.
 const DAEMON_URL_RE = /^http:\/\/127\.0\.0\.1:\d+\/(play|stream)(\/|\?|$)/;
+
+// Auto-tune constants. Threshold pair (cache-secs, demuxer-max-bytes) is what
+// actually bounds mpv's forward cache — whichever is smaller wins. For
+// high-bitrate streams (4K, 80+ Mbps) a 256 MiB cap truncates the 30 s
+// cache; for low-bitrate streams it over-allocates. Auto-tune sizes the cap
+// to match the *actual* bitrate × cache-secs window with VBR headroom.
+const CACHE_SECS = 30;
+const VBR_MULTIPLIER = 1.5;
+const DEMUXER_MIN_MIB = 64;
+const DEMUXER_MAX_MIB = 1024;
+// Duration is not necessarily ready at iina.file-loaded — mpv may still be
+// reading the container header. Poll briefly, then give up.
+const DURATION_POLL_INTERVAL_MS = 200;
+const DURATION_POLL_ATTEMPTS = 25; // ~5 s budget
+
+let autoTuneApplied = false;
 let mpvBuffersApplied = false;
 function applyTorrentMpvBuffers(): void {
   if (mpvBuffersApplied) return;
   mpvBuffersApplied = true;
   mpv.set("cache", "yes");
   mpv.set("demuxer-max-bytes", `${opt.demuxerMaxBytesMiB}MiB`);
-  mpv.set("cache-secs", "30");
+  mpv.set("cache-secs", `${CACHE_SECS}`);
+}
+
+/** Recomputes demuxer-max-bytes to fit the active file's bitrate × cache-secs
+ * window, clamped to [DEMUXER_MIN_MIB, DEMUXER_MAX_MIB]. Called from the
+ * iina.file-loaded handler and from startTracking (in case file-loaded
+ * fired before the active torrent context was set up). No-op when auto-tune
+ * is disabled, when not playing a torrent stream, or when we can't yet
+ * resolve a positive bitrate. */
+function autoTuneDemuxerBuffer(): void {
+  if (!opt.demuxerMaxBytesAuto) return;
+  if (!active) return;
+  const path = mpv.getString("path");
+  if (!path || !DAEMON_URL_RE.test(path)) return;
+
+  let fileIdx = -1;
+  const match = STREAM_URL_FILE_IDX_RE.exec(path);
+  if (match) {
+    fileIdx = Number(match[1]);
+  } else if (path.includes("/play")) {
+    // Single-video /play URL: the daemon serves the primaryIndex file
+    // directly without a /stream redirect.
+    fileIdx = active.info.primaryIndex;
+  }
+  if (!Number.isInteger(fileIdx) || fileIdx < 0 || fileIdx >= active.info.files.length) {
+    return;
+  }
+  const file = active.info.files[fileIdx];
+  if (!file || file.length <= 0) return;
+
+  let attempts = 0;
+  const targetIdx = fileIdx;
+  const tick = () => {
+    attempts++;
+    // active may have been cleared while we were polling — abort cleanly.
+    if (!active) return;
+    const duration = mpv.getNumber("duration");
+    if (!Number.isFinite(duration) || duration <= 0) {
+      if (attempts >= DURATION_POLL_ATTEMPTS) {
+        diag(`auto-tune: duration unavailable after ${attempts} polls, keeping default cap`);
+        return;
+      }
+      setTimeout(tick, DURATION_POLL_INTERVAL_MS);
+      return;
+    }
+    const bytesPerSec = file.length / duration;
+    const targetBytes = bytesPerSec * CACHE_SECS * VBR_MULTIPLIER;
+    const targetMiB = Math.round(targetBytes / (1 << 20));
+    const clamped = Math.max(DEMUXER_MIN_MIB, Math.min(DEMUXER_MAX_MIB, targetMiB));
+    const mbps = ((bytesPerSec * 8) / 1e6).toFixed(1);
+    diag(
+      `auto-tune: file idx=${targetIdx} len=${file.length} dur=${duration.toFixed(1)}s ` +
+        `bitrate=${mbps}Mbps → demuxer-max-bytes=${clamped}MiB`,
+    );
+    mpv.set("demuxer-max-bytes", `${clamped}MiB`);
+    autoTuneApplied = true;
+  };
+  tick();
 }
 
 /** Reveals the sidebar, deferring if it is not loaded yet. */
@@ -140,6 +213,13 @@ function startTracking(port: number, info: TorrentStatus, multiVideo: boolean): 
   };
   diag(`tracking started for ${info.name}`);
 
+  // iina.file-loaded may have fired before active was set (race between
+  // mpv opening the URL and our metadata poll completing). Re-attempt
+  // auto-tune now that the torrent context is in place.
+  if (!autoTuneApplied) {
+    autoTuneDemuxerBuffer();
+  }
+
   heartbeatTimer = setInterval(() => {
     heartbeat(port);
   }, HEARTBEAT_INTERVAL);
@@ -168,7 +248,10 @@ function startTracking(port: number, info: TorrentStatus, multiVideo: boolean): 
 
 /** One tick of the multi-video progress watcher. Reads mpv's current file
  * URL + percent-pos; once playback crosses WARM_NEXT_THRESHOLD_PCT for a
- * file index not yet seen, fires a single warmNext for that index. */
+ * file index not yet seen, fires a warmNext for that index. The daemon may
+ * defer the head warm if the active stream's buffer is too thin; on a
+ * deferred result we leave the index out of warmedAfter so the next tick
+ * (~5 s later) retries. */
 function watchProgress(): void {
   if (!active) return;
   const percent = mpv.getNumber("percent-pos");
@@ -179,9 +262,29 @@ function watchProgress(): void {
   if (!match) return; // not a daemon /stream URL (e.g. transient /play URL)
   const currentIdx = Number(match[1]);
   if (!Number.isInteger(currentIdx) || active.warmedAfter.has(currentIdx)) return;
-  active.warmedAfter.add(currentIdx);
-  diag(`warm-next triggered after idx=${currentIdx} at ${percent.toFixed(1)}%`);
-  void warmNext(active.port, active.infohash, currentIdx);
+  // stream-pos is bytes into the file mpv is reading. Pass to the daemon so
+  // it can gate the 128 MiB head-warm of the NEXT file on this file's
+  // contiguous buffer being healthy.
+  const streamPos = mpv.getNumber("stream-pos");
+  const offset = Number.isFinite(streamPos) && streamPos > 0 ? streamPos : undefined;
+  diag(`warm-next request after idx=${currentIdx} at ${percent.toFixed(1)}% offset=${offset ?? "?"}`);
+  const portSnapshot = active.port;
+  const ihSnapshot = active.infohash;
+  void warmNext(portSnapshot, ihSnapshot, currentIdx, offset).then((result) => {
+    if (result.deferred) {
+      diag(`warm-next deferred for idx=${currentIdx} — will retry on next tick`);
+      return;
+    }
+    // Latch in the per-window set so we don't re-fire for the same index on
+    // every subsequent tick. Daemon-side mt.warmedHead is also idempotent,
+    // but skipping the round-trip is cheaper. Refer to the snapshot of
+    // `active` we captured at call time — by the time the promise resolves
+    // the user may have switched torrents, in which case the new active set
+    // is unrelated and shouldn't be polluted with this index.
+    if (active && active.port === portSnapshot && active.infohash === ihSnapshot) {
+      active.warmedAfter.add(currentIdx);
+    }
+  });
 }
 
 /** Stops all tracking and clears the active-torrent state. */
@@ -412,13 +515,21 @@ event.on("iina.window-will-close", () => {
   closePendingProgress();
 });
 
+// Recompute demuxer-max-bytes when mpv finishes opening a new file. For a
+// multi-video playlist this fires for each episode; reset the latch so we
+// re-tune for the new file's bitrate (could differ between episodes —
+// different encoders/qualities). For a single file it fires once.
+event.on("iina.file-loaded", () => {
+  autoTuneApplied = false;
+  autoTuneDemuxerBuffer();
+});
+
 // Mirror mpv's pause state into the daemon so it stops prefetching pieces
 // while the viewer is paused (and starts again on resume). Avoids burning
 // bandwidth on a movie that may never be unpaused.
 event.on("mpv.pause.changed", () => {
   if (!active) return;
   const paused = mpv.getFlag("pause");
-  diag(`pause-changed: ${paused}`);
   if (paused) {
     void pauseTorrent(active.port, active.infohash);
   } else {
