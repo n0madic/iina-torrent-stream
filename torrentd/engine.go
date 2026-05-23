@@ -139,11 +139,9 @@ type managedTorrent struct {
 	addedAt time.Time
 	warmed  map[int]bool // file indexes whose tail has already been warmed
 
-	// paused suspends look-ahead downloading while the viewer is paused. It is
-	// applied to streaming readers by zeroing their readahead; in-flight chunk
-	// requests still complete, but no new pieces are prioritised. readers
-	// tracks the live streaming readers so /pause and /resume can adjust them.
-	paused  bool
+	// readers tracks the live streaming readers. gcLoop uses len(readers) > 0
+	// to decide whether a torrent is still in use; /debug/memstats sums the
+	// counts across torrents.
 	readers []torrent.Reader
 
 	// lastActiveAt is updated on every per-torrent client interaction
@@ -416,13 +414,14 @@ func (e *Engine) collectGarbage() {
 	}
 }
 
-// Pause stops the torrent from prefetching new pieces while keeping in-flight
-// chunk requests in place. Returns false only when the torrent is not loaded.
-//
-// SetReadahead is called under e.mu so it cannot race against Stream's
-// cleanup path (which also takes e.mu before removing a reader from
-// mt.readers). Iterating with the lock held briefly blocks other engine
-// operations, but the call is a cheap field update inside anacrolix.
+// Pause marks the torrent as touched by the plugin (the player went on
+// pause) and returns false only when the torrent is not loaded. It does NOT
+// shrink the readahead window — on slow links the user pauses precisely to
+// let the buffer fill, so look-ahead downloading must keep going. Anacrolix
+// stops requesting new pieces on its own once the window is satisfied.
+// Refreshing lastActiveAt extends the gcLoop idle window so a brief gap
+// between reader teardown and the next interaction cannot evict the torrent
+// during a pause.
 func (e *Engine) Pause(ih string) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -430,19 +429,14 @@ func (e *Engine) Pause(ih string) bool {
 	if !ok {
 		return false
 	}
-	mt.paused = true
 	mt.lastActiveAt = time.Now()
-	for _, r := range mt.readers {
-		r.SetReadahead(0)
-	}
 	log.Printf("paused torrent %s", ih)
 	return true
 }
 
-// Resume restores the streaming look-ahead window on a previously paused
-// torrent. Returns false only when the torrent is not loaded.
-//
-// See Pause for the locking rationale.
+// Resume is the symmetric counterpart to Pause — the plugin calls it on
+// mpv's resume event. It only refreshes lastActiveAt and logs; the readahead
+// window was never lowered, so there is nothing to restore.
 func (e *Engine) Resume(ih string) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -450,11 +444,7 @@ func (e *Engine) Resume(ih string) bool {
 	if !ok {
 		return false
 	}
-	mt.paused = false
 	mt.lastActiveAt = time.Now()
-	for _, r := range mt.readers {
-		r.SetReadahead(e.readahead)
-	}
 	log.Printf("resumed torrent %s", ih)
 	return true
 }
@@ -492,20 +482,11 @@ func (e *Engine) Stream(w http.ResponseWriter, r *http.Request, ih string, idx i
 	defer reader.Close()
 	reader.SetResponsive()
 
-	// Register the reader and apply the current pause state under the same
-	// lock — otherwise a concurrent Pause could iterate mt.readers (already
-	// containing this reader) and call SetReadahead(0) on it, and we would
-	// then overwrite that with e.readahead, silently defeating the pause.
-	// We register BEFORE spawning warmTail so the main reader is always the
-	// first entry in mt.readers for any given Stream — this makes the
-	// pause-state propagation deterministic across the two readers.
+	// Register the reader under e.mu so the append is consistent with
+	// gcLoop's len(mt.readers) read and /debug/memstats' sum.
 	e.mu.Lock()
 	mt.readers = append(mt.readers, reader)
-	if mt.paused {
-		reader.SetReadahead(0)
-	} else {
-		reader.SetReadahead(e.readahead)
-	}
+	reader.SetReadahead(e.readahead)
 	// Touch on stream start. While the reader is registered the gcLoop will
 	// not evict because len(readers) > 0; this stamp covers the window
 	// between unregistration and any next interaction.
@@ -592,9 +573,9 @@ func (e *Engine) Play(ctx context.Context, source string) (*managedTorrent, int,
 // HTTP URLs with "Unsupported external subtitles".
 //
 // Reading is intentionally done WITHOUT registering the reader in
-// mt.readers — a pre-warm must complete even while the user has paused the
-// torrent (subtitles are typically loaded at start, before any pause), and
-// pause sets every registered reader's readahead to zero.
+// mt.readers — Prewarm reads the file to completion via io.Copy on its own
+// schedule, so it should not be visible to anything that iterates
+// mt.readers (currently only gcLoop and /debug/memstats).
 func (e *Engine) Prewarm(ctx context.Context, ih string, idx int) (string, error) {
 	mt := e.get(ih)
 	if mt == nil {
@@ -656,16 +637,11 @@ func (e *Engine) warmTail(mt *managedTorrent, idx int, f *torrent.File) {
 		tr := f.NewReader()
 		defer tr.Close()
 		tr.SetResponsive()
-		// Register so /pause can stop the warm prefetch too; otherwise a
-		// paused torrent still bleeds 4 MiB (plus default readahead) on the
-		// first /stream request because warmTail uses its own private reader.
+		// Register the warm reader so gcLoop sees the torrent as in-use for
+		// as long as the tail prefetch is running.
 		e.mu.Lock()
 		mt.readers = append(mt.readers, tr)
-		if mt.paused {
-			tr.SetReadahead(0)
-		} else {
-			tr.SetReadahead(e.readahead)
-		}
+		tr.SetReadahead(e.readahead)
 		e.mu.Unlock()
 		defer func() {
 			e.mu.Lock()
