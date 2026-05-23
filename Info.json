@@ -1,7 +1,7 @@
 {
   "name": "Torrent Stream",
   "identifier": "com.github.n0madic.iina-torrent-stream",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Stream torrents directly into IINA with seeking and buffering, powered by a native companion engine.",
   "ghRepo": "n0madic/iina-torrent-stream",
   "author": {

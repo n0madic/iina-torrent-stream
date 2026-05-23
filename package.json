@@ -1,6 +1,6 @@
 {
   "name": "iina-torrent-stream",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Stream torrents directly into IINA with seeking and buffering support",
   "license": "MIT",
   "private": true,
