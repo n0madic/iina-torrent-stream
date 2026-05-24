@@ -112,7 +112,7 @@ func (s *server) handleAddTorrent(w http.ResponseWriter, r *http.Request) {
 	// Return the partial status (just the infohash and peer counts) without
 	// waiting for metadata, so the HTTP request always completes inside
 	// IINA's hidden request timeout. The plugin polls for the file list.
-	status, ok := s.engine.Status(mt.t.InfoHash().HexString())
+	status, ok := s.engine.Status(mt.t.Load().InfoHash().HexString())
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "torrent vanished after add")
 		return
@@ -193,7 +193,7 @@ func (s *server) handlePlay(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	t := mt.t
+	t := mt.t.Load()
 	ih := t.InfoHash().HexString()
 	files := t.Files()
 

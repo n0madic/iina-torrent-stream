@@ -134,20 +134,27 @@ func main() {
 	// file is what you read to find out why the cache was not purged. We
 	// O_TRUNC on every startup so it never accumulates across daemon runs —
 	// only the current session is kept, and the file is listed first in the
-	// sink so a broken stderr never starves it.
+	// sink so a broken stderr never starves it. The whole sink is wrapped
+	// in resendErrorMonitor so the uTP "error resending packet" spam is
+	// dropped from the log AND counted for the network watchdog (engine's
+	// recoveryLoop reads the counter and rebuilds the client when it spikes).
 	logFilePath := filepath.Join(cfg.dataDir, "torrentd.log")
 	// 0o600: the log may contain the daemon's listening port and infohashes
 	// of opened torrents — readable only by the owning user.
 	logFile, ferr := os.OpenFile(logFilePath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	var sink io.Writer
 	if ferr != nil {
 		// Surface the reason — silently falling back to stderr-only means
 		// every later log line vanishes once IINA closes the stderr pipe,
 		// taking with it the diagnostics that prove cleanup actually ran.
 		log.Printf("warning: open log file %s: %v (logging to stderr only)", logFilePath, ferr)
+		sink = os.Stderr
 	} else {
-		log.SetOutput(&multiSink{ws: []io.Writer{logFile, os.Stderr}})
+		sink = &multiSink{ws: []io.Writer{logFile, os.Stderr}}
 		defer func() { _ = logFile.Close() }()
 	}
+	monitor := newResendErrorMonitor(sink)
+	log.SetOutput(monitor)
 
 	// A previous daemon may have exited without cleaning up (hard kill, crash,
 	// or the host app quitting). We now hold the singleton lock, so any leftover
@@ -168,7 +175,7 @@ func main() {
 	// spawn a fresh, clean daemon).
 	defer func() { _ = os.Remove(cfg.stateFile) }()
 
-	engine, err := NewEngine(cfg.dataDir, cfg.cacheDir, cfg.readaheadBytes, cfg.seed)
+	engine, err := NewEngine(cfg.dataDir, cfg.cacheDir, cfg.readaheadBytes, cfg.seed, monitor)
 	if err != nil {
 		log.Fatalf("start torrent engine: %v", err)
 	}

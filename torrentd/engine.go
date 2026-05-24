@@ -13,6 +13,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/anacrolix/torrent"
@@ -93,6 +94,23 @@ const (
 	torrentIdleTimeout = 2 * time.Minute
 	// torrentGCInterval is how often the GC loop scans for evictable torrents.
 	torrentGCInterval = 30 * time.Second
+
+	// recoveryCheckInterval, recoveryWindowBuckets and recoveryErrorThreshold
+	// configure the network-stall watchdog. Every recoveryCheckInterval the
+	// loop drains the resendErrorMonitor counter into a rolling window of
+	// recoveryWindowBuckets entries; when the sum across the window crosses
+	// recoveryErrorThreshold the torrent client is rebuilt. The default of
+	// 30 errors over 30 s (3 × 10 s buckets) catches the post-VPN-flap
+	// "every uTP send is ENETUNREACH" storm — observed at ~2 errors/s in
+	// the wild — without firing on a one-second blip of a handful of packets.
+	recoveryCheckInterval  = 10 * time.Second
+	recoveryWindowBuckets  = 3
+	recoveryErrorThreshold = 30
+	// recoveryBackoff is the minimum gap between two successive client
+	// rebuilds. A rebuild that does not actually clear the routing problem
+	// (e.g. the underlying network is still broken) would otherwise loop
+	// continuously, churning peer connections and adding nothing.
+	recoveryBackoff = 60 * time.Second
 )
 
 // publicTrackers is a small curated set of stable public BitTorrent trackers,
@@ -112,10 +130,19 @@ var publicTrackers = [][]string{
 // Engine wraps an anacrolix torrent client and exposes the operations the HTTP
 // server needs: adding sources, streaming files, and reporting status.
 type Engine struct {
-	client *torrent.Client
-	// storage is held so Close can shut down the piece-completion DB. The
-	// torrent client does not close its default storage on its own.
+	// client is held via atomic.Pointer because the network-stall watchdog
+	// can swap it out from under callers (recreateClient). Callers must
+	// e.client.Load() once and pass the result down — re-loading mid-operation
+	// would race the swap.
+	client atomic.Pointer[torrent.Client]
+	// storage is held so Close can shut down the piece-completion DB and so
+	// recreateClient can hand the same storage to the rebuilt client (which
+	// keeps every already-downloaded piece). The torrent client does not
+	// close its default storage on its own.
 	storage storage.ClientImplCloser
+	// seed is captured here so recreateClient can rebuild the client config
+	// without the caller having to plumb the flag through again.
+	seed bool
 
 	// cacheDir is the on-disk root anacrolix writes torrent files to. We use it
 	// to construct absolute paths for callers that want to read a torrent file
@@ -127,14 +154,20 @@ type Engine struct {
 	// reader — how much data is kept prioritised ahead of the play cursor.
 	readahead int64
 
+	// monitor counts uTP resend-failure log lines so recoveryLoop can detect a
+	// dead-socket condition. Optional: nil disables the watchdog (used by
+	// tests that never wire the std logger through resendErrorMonitor).
+	monitor *resendErrorMonitor
+
 	// done is closed by Close; sampleLoop watches it so the rate-sampler goroutine
 	// exits cleanly instead of running after the underlying client is gone.
 	done chan struct{}
-	// wg tracks all goroutines spawned by the engine (sampleLoop +
-	// completeMetadata workers) so Close can wait for them to exit before it
-	// closes the torrent client. Without this wait, sampleLoop could call
-	// mt.t.Stats() and completeMetadata could call t.AddTrackers concurrently
-	// with client.Close — anacrolix does not document those as safe.
+	// wg tracks all goroutines spawned by the engine (sampleLoop, gcLoop,
+	// recoveryLoop + completeMetadata workers) so Close can wait for them to
+	// exit before it closes the torrent client. Without this wait, sampleLoop
+	// could call t.Stats() and completeMetadata could call t.AddTrackers
+	// concurrently with client.Close — anacrolix does not document those
+	// as safe.
 	wg sync.WaitGroup
 
 	mu       sync.Mutex
@@ -143,7 +176,13 @@ type Engine struct {
 
 // managedTorrent holds per-torrent bookkeeping, including download-rate samples.
 type managedTorrent struct {
-	t          *torrent.Torrent
+	// t is the current *torrent.Torrent handle. Held atomically because the
+	// network-stall watchdog can swap it (recreateClient): the rest of the
+	// engine reads via t.Load() so a swap mid-call simply means later
+	// operations land on the new torrent. Any in-flight reader bound to the
+	// previous handle will see EOF/error on its next Read once the old
+	// client is closed and unwind normally.
+	t          atomic.Pointer[torrent.Torrent]
 	addedAt    time.Time
 	warmed     map[int]bool // file indexes whose tail has already been warmed
 	warmedHead map[int]bool // file indexes whose head has already been warmed
@@ -170,10 +209,50 @@ type managedTorrent struct {
 
 // NewEngine creates the torrent client and sets the streaming read-ahead
 // window. readaheadBytes is the requested look-ahead size; values outside
-// [readaheadMin, readaheadMax] are clamped.
-func NewEngine(dataDir, cacheDir string, readaheadBytes int64, seed bool) (*Engine, error) {
+// [readaheadMin, readaheadMax] are clamped. monitor may be nil (in which
+// case the network-stall watchdog is disabled — useful for tests).
+func NewEngine(dataDir, cacheDir string, readaheadBytes int64, seed bool, monitor *resendErrorMonitor) (*Engine, error) {
 	store := newStreamStorage(cacheDir)
 
+	client, err := buildTorrentClient(cacheDir, store, seed)
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+
+	// Clamp the configured read-ahead window into a sane range. The window is
+	// what keeps the whole peer swarm busy — too small and most peers go idle.
+	readahead := max(readaheadBytes, readaheadMin)
+	if readahead > readaheadMax {
+		readahead = readaheadMax
+	}
+
+	e := &Engine{
+		storage:   store,
+		seed:      seed,
+		cacheDir:  cacheDir,
+		readahead: readahead,
+		monitor:   monitor,
+		done:      make(chan struct{}),
+		torrents:  make(map[string]*managedTorrent),
+	}
+	e.client.Store(client)
+	e.wg.Add(2)
+	go func() { defer e.wg.Done(); e.sampleLoop() }()
+	go func() { defer e.wg.Done(); e.gcLoop() }()
+	if monitor != nil {
+		e.wg.Add(1)
+		go func() { defer e.wg.Done(); e.recoveryLoop() }()
+	}
+	return e, nil
+}
+
+// buildTorrentClient is the single source of truth for the torrent client
+// configuration — used both for the engine's initial client and for the
+// recoveryLoop's rebuild. cacheDir is the DataDir; store is the storage
+// implementation that owns the on-disk piece layout and BoltDB completion
+// records (shared across rebuilds so already-downloaded pieces survive).
+func buildTorrentClient(cacheDir string, store storage.ClientImplCloser, seed bool) (*torrent.Client, error) {
 	cfg := torrent.NewDefaultClientConfig()
 	cfg.DataDir = cacheDir
 	cfg.DefaultStorage = store
@@ -199,42 +278,25 @@ func NewEngine(dataDir, cacheDir string, readaheadBytes int64, seed bool) (*Engi
 
 	client, err := torrent.NewClient(cfg)
 	if err != nil {
-		_ = store.Close()
 		return nil, fmt.Errorf("create torrent client: %w", err)
 	}
-
-	// Clamp the configured read-ahead window into a sane range. The window is
-	// what keeps the whole peer swarm busy — too small and most peers go idle.
-	readahead := max(readaheadBytes, readaheadMin)
-	if readahead > readaheadMax {
-		readahead = readaheadMax
-	}
-
-	e := &Engine{
-		client:    client,
-		storage:   store,
-		cacheDir:  cacheDir,
-		readahead: readahead,
-		done:      make(chan struct{}),
-		torrents:  make(map[string]*managedTorrent),
-	}
-	e.wg.Add(2)
-	go func() { defer e.wg.Done(); e.sampleLoop() }()
-	go func() { defer e.wg.Done(); e.gcLoop() }()
-	return e, nil
+	return client, nil
 }
 
 // Close shuts the torrent client and the underlying piece-completion DB down.
-// Engine goroutines (sampleLoop, completeMetadata workers) are signalled via
-// e.done and then waited on before the client is closed — calling
-// client.Close while sampleLoop is still inside mt.t.Stats(), or while a
-// completeMetadata worker is inside t.AddTrackers, races on anacrolix internals.
-// Closing the storage explicitly is what releases the BoltDB writer on the
-// completion DB — torrent.Client.Close does not close the default storage.
+// Engine goroutines (sampleLoop, gcLoop, recoveryLoop, completeMetadata
+// workers) are signalled via e.done and then waited on before the client is
+// closed — calling client.Close while sampleLoop is still inside t.Stats(),
+// or while a completeMetadata worker is inside t.AddTrackers, races on
+// anacrolix internals. Closing the storage explicitly is what releases the
+// BoltDB writer on the completion DB — torrent.Client.Close does not close
+// the default storage.
 func (e *Engine) Close() {
 	close(e.done)
 	e.wg.Wait()
-	e.client.Close()
+	if c := e.client.Load(); c != nil {
+		c.Close()
+	}
 	if err := e.storage.Close(); err != nil {
 		log.Printf("warning: close storage: %v", err)
 	}
@@ -250,24 +312,25 @@ func (e *Engine) Close() {
 // when metadata is ready by polling /torrents/{ih} for a non-empty file list.
 func (e *Engine) Add(ctx context.Context, source string) (*managedTorrent, error) {
 	source = strings.TrimSpace(source)
+	client := e.client.Load()
 	var (
 		t   *torrent.Torrent
 		err error
 	)
 	switch {
 	case strings.HasPrefix(source, "magnet:"):
-		t, err = e.client.AddMagnet(source)
+		t, err = client.AddMagnet(source)
 	case strings.HasPrefix(source, "http://"), strings.HasPrefix(source, "https://"):
 		var mi *metainfo.MetaInfo
 		mi, err = loadRemoteMetainfo(ctx, source)
 		if err == nil {
-			t, err = e.client.AddTorrent(mi)
+			t, err = client.AddTorrent(mi)
 		}
 	default:
 		var mi *metainfo.MetaInfo
 		mi, err = metainfo.LoadFromFile(source)
 		if err == nil {
-			t, err = e.client.AddTorrent(mi)
+			t, err = client.AddTorrent(mi)
 		}
 	}
 	if err != nil {
@@ -281,13 +344,13 @@ func (e *Engine) Add(ctx context.Context, source string) (*managedTorrent, error
 
 	now := time.Now()
 	mt := &managedTorrent{
-		t:            t,
 		addedAt:      now,
 		warmed:       make(map[int]bool),
 		warmedHead:   make(map[int]bool),
 		lastSampleAt: now,
 		lastActiveAt: now,
 	}
+	mt.t.Store(t)
 	e.mu.Lock()
 	e.torrents[ih] = mt
 	e.mu.Unlock()
@@ -296,7 +359,7 @@ func (e *Engine) Add(ctx context.Context, source string) (*managedTorrent, error
 	// Async: wait for metadata, attach public trackers once we know the
 	// private bit, or drop the torrent on timeout so it does not linger in
 	// anacrolix holding connections / DHT traffic forever.
-	e.wg.Go(func() { ; e.completeMetadata(mt) })
+	e.wg.Go(func() { e.completeMetadata(mt) })
 	return mt, nil
 }
 
@@ -306,7 +369,7 @@ func (e *Engine) Add(ctx context.Context, source string) (*managedTorrent, error
 func (e *Engine) completeMetadata(mt *managedTorrent) {
 	ctx, cancel := context.WithTimeout(context.Background(), metadataTimeout)
 	defer cancel()
-	t := mt.t
+	t := mt.t.Load()
 	ih := t.InfoHash().HexString()
 	select {
 	case <-t.GotInfo():
@@ -404,7 +467,7 @@ func (e *Engine) collectGarbage() {
 		toDrop = append(toDrop, struct {
 			ih string
 			t  *torrent.Torrent
-		}{ih, mt.t})
+		}{ih, mt.t.Load()})
 		delete(e.torrents, ih)
 	}
 	e.mu.Unlock()
@@ -466,7 +529,7 @@ func (e *Engine) Remove(ih string) bool {
 	if !ok {
 		return false
 	}
-	mt.t.Drop()
+	mt.t.Load().Drop()
 	log.Printf("removed torrent %s", ih)
 	return true
 }
@@ -479,7 +542,7 @@ func (e *Engine) Stream(w http.ResponseWriter, r *http.Request, ih string, idx i
 		http.Error(w, "torrent not found", http.StatusNotFound)
 		return
 	}
-	files := mt.t.Files()
+	files := mt.t.Load().Files()
 	if idx < 0 || idx >= len(files) {
 		http.Error(w, "file index out of range", http.StatusNotFound)
 		return
@@ -551,7 +614,7 @@ func (e *Engine) Play(ctx context.Context, source string) (*managedTorrent, int,
 	if err != nil {
 		return nil, -1, err
 	}
-	t := mt.t
+	t := mt.t.Load()
 	if t.Info() == nil {
 		select {
 		case <-t.GotInfo():
@@ -590,7 +653,7 @@ func (e *Engine) Prewarm(ctx context.Context, ih string, idx int) (string, error
 		return "", fmt.Errorf("torrent not found")
 	}
 	e.touch(ih)
-	files := mt.t.Files()
+	files := mt.t.Load().Files()
 	if idx < 0 || idx >= len(files) {
 		return "", fmt.Errorf("file index out of range")
 	}
@@ -739,12 +802,13 @@ func (e *Engine) WarmNext(ih string, afterIdx int, currentOffset int64) (int, bo
 	if mt == nil {
 		return -1, false, false, fmt.Errorf("torrent not found")
 	}
-	if mt.t.Info() == nil {
+	t := mt.t.Load()
+	if t.Info() == nil {
 		// No metadata yet — nothing to warm. Caller can retry once status
 		// reports a non-empty file list.
 		return -1, false, false, nil
 	}
-	files := mt.t.Files()
+	files := t.Files()
 	paths := make([]string, len(files))
 	for i, f := range files {
 		paths[i] = f.DisplayPath()
@@ -773,7 +837,7 @@ func (e *Engine) WarmNext(ih string, afterIdx int, currentOffset int64) (int, bo
 	// large background fetch would steal bandwidth from the file the user is
 	// actually watching. Defer; the plugin polls every 5 s and will retry.
 	if currentOffset > 0 && afterIdx >= 0 && afterIdx < len(files) {
-		ahead := contiguousBytesAhead(mt.t, afterIdx, currentOffset)
+		ahead := contiguousBytesAhead(t, afterIdx, currentOffset)
 		if ahead < warmNextHealthThreshold {
 			log.Printf("warm-next: torrent %s deferred (current idx=%d offset=%d contiguous_ahead=%d < %d)",
 				ih, afterIdx, currentOffset, ahead, warmNextHealthThreshold)
@@ -895,7 +959,7 @@ func (e *Engine) sampleLoop() {
 
 			now := time.Now()
 			for _, mt := range snapshot {
-				stats := mt.t.Stats()
+				stats := mt.t.Load().Stats()
 				read := stats.BytesReadData.Int64()
 				written := stats.BytesWrittenData.Int64()
 				e.mu.Lock()
@@ -947,7 +1011,7 @@ func (e *Engine) Status(ih string) (*TorrentStatus, bool) {
 	if mt == nil {
 		return nil, false
 	}
-	t := mt.t
+	t := mt.t.Load()
 	stats := t.Stats()
 
 	st := &TorrentStatus{
@@ -1147,4 +1211,182 @@ func mimeForPath(name string) string {
 		return m
 	}
 	return "application/octet-stream"
+}
+
+// recoveryAction is the verdict from a single watchdog tick.
+type recoveryAction int
+
+const (
+	recoveryNone     recoveryAction = iota // sum == 0, stay quiet
+	recoveryReport                         // 0 < sum < threshold, log only
+	recoveryCoolDown                       // sum >= threshold but inside backoff
+	recoveryRebuild                        // sum >= threshold and outside backoff
+)
+
+// recoveryDecision is the pure-logic policy of one watchdog tick: given the
+// rolling-window sum and the time elapsed since the last rebuild, decide
+// what (if anything) to do. Extracted so it can be unit-tested without
+// standing up a torrent client.
+func recoveryDecision(sum int64, sinceLastRebuild time.Duration, threshold int64, backoff time.Duration) recoveryAction {
+	switch {
+	case sum >= threshold && sinceLastRebuild >= backoff:
+		return recoveryRebuild
+	case sum >= threshold:
+		return recoveryCoolDown
+	case sum > 0:
+		return recoveryReport
+	default:
+		return recoveryNone
+	}
+}
+
+// recoveryLoop is the network-stall watchdog. Every recoveryCheckInterval it
+// drains the resendErrorMonitor counter into a rolling window and triggers a
+// torrent.Client rebuild when the window sum crosses recoveryErrorThreshold —
+// the post-VPN-flap / post-network-change / post-sleep state where every uTP
+// send returns ENETUNREACH and the daemon would otherwise never recover.
+// recoveryBackoff bounds how often a rebuild can fire so a persistent network
+// outage does not become an infinite rebuild loop.
+func (e *Engine) recoveryLoop() {
+	ticker := time.NewTicker(recoveryCheckInterval)
+	defer ticker.Stop()
+	var (
+		window      [recoveryWindowBuckets]int64
+		idx         int
+		lastRebuild time.Time
+	)
+	windowSeconds := int(recoveryCheckInterval.Seconds()) * recoveryWindowBuckets
+	for {
+		select {
+		case <-e.done:
+			return
+		case <-ticker.C:
+			n := e.monitor.LoadAndReset()
+			window[idx] = n
+			idx = (idx + 1) % recoveryWindowBuckets
+			var sum int64
+			for _, v := range window {
+				sum += v
+			}
+			// On the very first tick lastRebuild is the zero value, so
+			// time.Since returns a huge duration that always passes the
+			// backoff check — exactly what we want.
+			switch recoveryDecision(sum, time.Since(lastRebuild), recoveryErrorThreshold, recoveryBackoff) {
+			case recoveryRebuild:
+				log.Printf("network watchdog: %d uTP resend errors in %ds — rebuilding torrent client", sum, windowSeconds)
+				e.recreateClient()
+				lastRebuild = time.Now()
+				// Clear the window so the next decision is based on fresh
+				// data; otherwise we would immediately re-trigger.
+				for i := range window {
+					window[i] = 0
+				}
+			case recoveryCoolDown:
+				log.Printf("network watchdog: %d uTP resend errors in %ds (cool-down active, no rebuild)", sum, windowSeconds)
+			case recoveryReport:
+				log.Printf("network watchdog: %d uTP resend errors suppressed in %ds (below threshold %d)",
+					sum, windowSeconds, recoveryErrorThreshold)
+			case recoveryNone:
+				// nothing to do
+			}
+		}
+	}
+}
+
+// recreateClient tears down the current torrent.Client and builds a new one
+// against the same storage (so already-downloaded pieces and BoltDB
+// piece-completion survive). Every still-tracked managedTorrent is re-added
+// to the new client by infohash; its metainfo (when info bytes are present)
+// is re-supplied so the new torrent has the file list immediately.
+// In-flight streaming readers anchored on the previous torrent.Torrent will
+// return EOF/error on their next Read once the old client is closed — the
+// HTTP handler unwinds, mpv reconnects through /play and lands on the new
+// torrent. Engine state (mt.warmed, mt.lastActiveAt, etc.) is preserved
+// across the swap because we keep the managedTorrent value and only swap
+// its embedded atomic.Pointer.
+func (e *Engine) recreateClient() {
+	type snap struct {
+		ih      string
+		mt      *managedTorrent
+		mi      metainfo.MetaInfo
+		hasInfo bool
+	}
+
+	e.mu.Lock()
+	snaps := make([]snap, 0, len(e.torrents))
+	for ih, mt := range e.torrents {
+		t := mt.t.Load()
+		if t == nil {
+			continue
+		}
+		snaps = append(snaps, snap{
+			ih:      ih,
+			mt:      mt,
+			mi:      t.Metainfo(),
+			hasInfo: t.Info() != nil,
+		})
+	}
+	e.mu.Unlock()
+
+	// Close the old client BEFORE building the new one so the UDP sockets
+	// are released first. torrent.Client.Close does not close the storage,
+	// which is exactly what we want — the new client will reuse it.
+	oldClient := e.client.Load()
+	if oldClient != nil {
+		oldClient.Close()
+	}
+
+	newClient, err := buildTorrentClient(e.cacheDir, e.storage, e.seed)
+	if err != nil {
+		// We are now in a degenerate state: old client closed, no new one.
+		// Trigger a daemon shutdown so the next request from the plugin
+		// re-spawns a clean process — the alternative is logging and going
+		// silent, which would be worse for the user. The lifecycle is not
+		// in scope here, so we just log; the existing idle-timeout will
+		// eventually take down the now-mute daemon. A panic would skip the
+		// cache purge defers; avoided.
+		log.Printf("network watchdog: rebuilding torrent client failed: %v — daemon will appear hung until idle-timeout exit", err)
+		return
+	}
+	e.client.Store(newClient)
+
+	var readded, failed int
+	for _, s := range snaps {
+		var (
+			newT *torrent.Torrent
+			err  error
+		)
+		if s.hasInfo {
+			newT, err = newClient.AddTorrent(&s.mi)
+		} else {
+			h := s.mi.HashInfoBytes()
+			// HashInfoBytes returns the zero hash when InfoBytes is empty
+			// — which is exactly the magnet-still-resolving case. Parse
+			// the infohash from the map key instead so we always have one.
+			if h.IsZero() {
+				var parsed metainfo.Hash
+				if hashErr := parsed.FromHexString(s.ih); hashErr != nil {
+					log.Printf("network watchdog: cannot parse infohash %q: %v", s.ih, hashErr)
+					failed++
+					continue
+				}
+				h = parsed
+			}
+			var isNew bool
+			newT, isNew = newClient.AddTorrentInfoHash(h)
+			_ = isNew
+		}
+		if err != nil {
+			log.Printf("network watchdog: re-adding torrent %s failed: %v", s.ih, err)
+			failed++
+			continue
+		}
+		s.mt.t.Store(newT)
+		// Re-arm the metadata watcher so public trackers attach again once
+		// info arrives on the new client (same as Add does for fresh torrents).
+		mt := s.mt
+		e.wg.Go(func() { e.completeMetadata(mt) })
+		readded++
+	}
+	log.Printf("network watchdog: client rebuilt, %d torrent(s) re-added, %d failed", readded, failed)
 }
