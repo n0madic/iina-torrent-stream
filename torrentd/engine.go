@@ -339,6 +339,21 @@ func (e *Engine) Add(ctx context.Context, source string) (*managedTorrent, error
 
 	ih := t.InfoHash().HexString()
 	if mt := e.get(ih); mt != nil {
+		// Already tracked. AddMagnet/AddTorrent above are idempotent per
+		// infohash, so t is the live handle on the CURRENT client. A previous
+		// watchdog rebuild may have left mt.t pointing at a torrent from a
+		// since-closed client (re-add fell back, or the client was swapped
+		// out from under an in-flight reader) — that stale handle serves
+		// frozen status and EOFs every read. Adopt the live handle so playback
+		// self-heals when the plugin re-opens the source, no daemon restart
+		// needed. The compare keeps the common healthy re-open a no-op
+		// (anacrolix returns the same *Torrent for an existing infohash).
+		if mt.t.Load() != t {
+			mt.t.Store(t)
+			e.wg.Go(func() { e.completeMetadata(mt) })
+			log.Printf("re-bound torrent %s to the current client", ih)
+		}
+		e.touch(ih)
 		return mt, nil
 	}
 
@@ -1305,21 +1320,14 @@ func (e *Engine) recoveryLoop() {
 // across the swap because we keep the managedTorrent value and only swap
 // its embedded atomic.Pointer.
 func (e *Engine) recreateClient() {
-	type snap struct {
-		ih      string
-		mt      *managedTorrent
-		mi      metainfo.MetaInfo
-		hasInfo bool
-	}
-
 	e.mu.Lock()
-	snaps := make([]snap, 0, len(e.torrents))
+	snaps := make([]reAddSnapshot, 0, len(e.torrents))
 	for ih, mt := range e.torrents {
 		t := mt.t.Load()
 		if t == nil {
 			continue
 		}
-		snaps = append(snaps, snap{
+		snaps = append(snaps, reAddSnapshot{
 			ih:      ih,
 			mt:      mt,
 			mi:      t.Metainfo(),
@@ -1352,43 +1360,16 @@ func (e *Engine) recreateClient() {
 
 	var readded, failed int
 	for _, s := range snaps {
-		var (
-			newT *torrent.Torrent
-			err  error
-		)
-		if s.hasInfo {
-			// t.Metainfo() reconstructs PieceLayers via pieceLayers(), which
-			// always allocates a non-nil map even for v1 torrents that have no
-			// piece layers at all. anacrolix's addPieceLayersLocked only
-			// short-circuits on a nil map, so an empty-but-non-nil one makes it
-			// error "no piece root set for file" on every v1 file with >1 piece
-			// — orphaning the torrent on every watchdog rebuild. Drop the empty
-			// map so v1 re-adds cleanly; genuine v2/hybrid layers are non-empty
-			// and preserved.
-			if len(s.mi.PieceLayers) == 0 {
-				s.mi.PieceLayers = nil
-			}
-			newT, err = newClient.AddTorrent(&s.mi)
-		} else {
-			h := s.mi.HashInfoBytes()
-			// HashInfoBytes returns the zero hash when InfoBytes is empty
-			// — which is exactly the magnet-still-resolving case. Parse
-			// the infohash from the map key instead so we always have one.
-			if h.IsZero() {
-				var parsed metainfo.Hash
-				if hashErr := parsed.FromHexString(s.ih); hashErr != nil {
-					log.Printf("network watchdog: cannot parse infohash %q: %v", s.ih, hashErr)
-					failed++
-					continue
-				}
-				h = parsed
-			}
-			var isNew bool
-			newT, isNew = newClient.AddTorrentInfoHash(h)
-			_ = isNew
-		}
-		if err != nil {
-			log.Printf("network watchdog: re-adding torrent %s failed: %v", s.ih, err)
+		newT, ok := e.readdToClient(newClient, s)
+		if !ok {
+			// No live handle could be obtained on the new client. Stop
+			// serving a stale handle from the now-closed client: drop the
+			// torrent from tracking so its endpoints honestly 404 and the
+			// next /play recreates it fresh, rather than freezing forever on
+			// dead status / EOF reads.
+			e.mu.Lock()
+			delete(e.torrents, s.ih)
+			e.mu.Unlock()
 			failed++
 			continue
 		}
@@ -1400,4 +1381,78 @@ func (e *Engine) recreateClient() {
 		readded++
 	}
 	log.Printf("network watchdog: client rebuilt, %d torrent(s) re-added, %d failed", readded, failed)
+}
+
+// reAddSnapshot captures the minimum a tracked torrent needs to be
+// re-registered on a freshly rebuilt client (see recreateClient /
+// readdToClient). mi is a copy of the torrent's metainfo taken before the old
+// client is closed.
+type reAddSnapshot struct {
+	ih      string
+	mt      *managedTorrent
+	mi      metainfo.MetaInfo
+	hasInfo bool
+}
+
+// resolveInfohash returns the torrent's infohash from its snapshot, preferring
+// the info bytes (set once metadata is known) and falling back to the hex map
+// key. The info-bytes branch is gated on len(InfoBytes) > 0 because
+// HashInfoBytes() is SHA1(InfoBytes): for an info-less magnet it would return
+// SHA1("") (a non-zero hash) rather than the real infohash, so .IsZero() is not
+// a usable guard. ok is false only when neither source yields a parseable hash
+// — which cannot happen for a tracked torrent whose key is its hex infohash,
+// but is handled so callers never use a bogus hash.
+func resolveInfohash(ih string, mi *metainfo.MetaInfo) (h metainfo.Hash, ok bool) {
+	if len(mi.InfoBytes) > 0 {
+		return mi.HashInfoBytes(), true
+	}
+	if err := h.FromHexString(ih); err != nil {
+		return metainfo.Hash{}, false
+	}
+	return h, true
+}
+
+// readdToClient re-registers a snapshotted torrent on the rebuilt client and
+// returns a live handle. It first tries the full-metainfo path, which preserves
+// genuine v2/hybrid piece layers; on ANY error there it falls back to an
+// infohash-only add and re-supplies the info bytes. The fallback cannot hit the
+// piece-layer validation that the full path can, so it yields a live torrent
+// that re-verifies the surviving on-disk pieces and resumes downloading instead
+// of leaving the torrent orphaned until a daemon restart. ok is false only when
+// the infohash itself cannot be resolved (so the caller drops the torrent
+// rather than keep a dead handle).
+func (e *Engine) readdToClient(cl *torrent.Client, s reAddSnapshot) (*torrent.Torrent, bool) {
+	if s.hasInfo {
+		// t.Metainfo() reconstructs PieceLayers via pieceLayers(), which always
+		// allocates a non-nil map even for v1 torrents that have none.
+		// anacrolix's addPieceLayersLocked only short-circuits on a nil map, so
+		// an empty-but-non-nil one errors "no piece root set for file" on every
+		// v1 file with >1 piece (and AddTorrentSpec then Drops the torrent).
+		// Nil the empty map so v1 re-adds cleanly; real v2/hybrid layers are
+		// non-empty and preserved.
+		mi := s.mi
+		if len(mi.PieceLayers) == 0 {
+			mi.PieceLayers = nil
+		}
+		t, err := cl.AddTorrent(&mi)
+		if err == nil {
+			return t, true
+		}
+		log.Printf("network watchdog: AddTorrent for %s failed (%v); falling back to infohash add", s.ih, err)
+	}
+
+	h, ok := resolveInfohash(s.ih, &s.mi)
+	if !ok {
+		log.Printf("network watchdog: cannot resolve infohash for %q; dropping torrent", s.ih)
+		return nil, false
+	}
+	t, _ := cl.AddTorrentInfoHash(h)
+	// Re-supply known metadata so the torrent has its file list immediately and
+	// matches the surviving on-disk pieces; harmless no-op when info is absent.
+	if len(s.mi.InfoBytes) > 0 {
+		if err := t.SetInfoBytes(s.mi.InfoBytes); err != nil {
+			log.Printf("network watchdog: re-supplying info bytes for %s failed: %v", s.ih, err)
+		}
+	}
+	return t, true
 }

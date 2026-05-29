@@ -553,29 +553,18 @@ func TestSelectPrimaryIndex(t *testing.T) {
 	}
 }
 
-// TestRecreateClient_ReAddsV1Torrent is a regression guard for the network-stall
-// watchdog. recreateClient re-adds every tracked torrent to the rebuilt client
-// via t.Metainfo(); for a v1 torrent that reconstructed metainfo carries a
-// non-nil but EMPTY PieceLayers map, which made anacrolix's AddTorrent fail with
-// "no piece root set for file" — silently dropping the torrent so playback and
-// download froze. This builds a real multi-piece v1 torrent, rebuilds the
-// client, and asserts the torrent survives the swap.
-func TestRecreateClient_ReAddsV1Torrent(t *testing.T) {
-	monitor := newResendErrorMonitor(io.Discard)
-	e, err := NewEngine(t.TempDir(), t.TempDir(), readaheadMin, false, monitor)
-	if err != nil {
-		t.Fatalf("NewEngine: %v", err)
-	}
-	defer e.Close()
-
-	// A multi-piece file is required: addPieceLayersLocked only inspects files
-	// whose numPieces() > 1, so a single-piece torrent would not trip the bug.
+// buildV1Metainfo builds a real multi-piece v1 torrent over a freshly generated
+// content file and returns its metainfo (with InfoBytes set). The torrent is
+// marked private so tests stay network-quiet (no public-tracker announces), and
+// >1 piece is required to exercise the piece-layer path that tripped the bug.
+func buildV1Metainfo(t *testing.T) metainfo.MetaInfo {
+	t.Helper()
 	contentFile := filepath.Join(t.TempDir(), "video.bin")
 	if err := os.WriteFile(contentFile, make([]byte, 64<<10), 0o644); err != nil {
 		t.Fatalf("write content: %v", err)
 	}
 	info := metainfo.Info{PieceLength: 16 << 10} // 64 KiB / 16 KiB = 4 pieces
-	private := true                              // hermetic: skip public-tracker announces
+	private := true
 	info.Private = &private
 	if err := info.BuildFromFilePath(contentFile); err != nil {
 		t.Fatalf("BuildFromFilePath: %v", err)
@@ -584,7 +573,14 @@ func TestRecreateClient_ReAddsV1Torrent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal info: %v", err)
 	}
-	mi := metainfo.MetaInfo{InfoBytes: infoBytes}
+	return metainfo.MetaInfo{InfoBytes: infoBytes}
+}
+
+// writeV1Torrent writes buildV1Metainfo to a .torrent file and returns its path,
+// suitable for engine.Add (the local-file source branch).
+func writeV1Torrent(t *testing.T) string {
+	t.Helper()
+	mi := buildV1Metainfo(t)
 	torrentPath := filepath.Join(t.TempDir(), "test.torrent")
 	f, err := os.Create(torrentPath)
 	if err != nil {
@@ -595,8 +591,32 @@ func TestRecreateClient_ReAddsV1Torrent(t *testing.T) {
 		t.Fatalf("write torrent file: %v", err)
 	}
 	f.Close()
+	return torrentPath
+}
 
-	mt, err := e.Add(context.Background(), torrentPath)
+// newTestEngine builds an Engine on throwaway temp dirs with the network-stall
+// watchdog wired (monitor discards output).
+func newTestEngine(t *testing.T) *Engine {
+	t.Helper()
+	e, err := NewEngine(t.TempDir(), t.TempDir(), readaheadMin, false, newResendErrorMonitor(io.Discard))
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	t.Cleanup(e.Close)
+	return e
+}
+
+// TestRecreateClient_ReAddsV1Torrent is a regression guard for the network-stall
+// watchdog. recreateClient re-adds every tracked torrent to the rebuilt client
+// via t.Metainfo(); for a v1 torrent that reconstructed metainfo carries a
+// non-nil but EMPTY PieceLayers map, which made anacrolix's AddTorrent fail with
+// "no piece root set for file" — silently dropping the torrent so playback and
+// download froze. This builds a real multi-piece v1 torrent, rebuilds the
+// client, and asserts the torrent survives the swap.
+func TestRecreateClient_ReAddsV1Torrent(t *testing.T) {
+	e := newTestEngine(t)
+
+	mt, err := e.Add(context.Background(), writeV1Torrent(t))
 	if err != nil {
 		t.Fatalf("Add: %v", err)
 	}
@@ -618,5 +638,99 @@ func TestRecreateClient_ReAddsV1Torrent(t *testing.T) {
 	}
 	if got := newT.InfoHash(); got != wantIH {
 		t.Errorf("re-added torrent infohash = %v, want %v", got, wantIH)
+	}
+}
+
+// TestAdd_ReBindsHandleAfterClientSwap covers the self-heal path: when a tracked
+// torrent has been orphaned on a since-closed client (the frozen-playback state
+// before the fix), re-opening the same source must adopt a live handle on the
+// current client instead of returning the dead one.
+func TestAdd_ReBindsHandleAfterClientSwap(t *testing.T) {
+	e := newTestEngine(t)
+	torrentPath := writeV1Torrent(t)
+
+	mt, err := e.Add(context.Background(), torrentPath)
+	if err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	oldT := mt.t.Load()
+	ih := oldT.InfoHash().HexString()
+
+	// Simulate a watchdog rebuild that swapped the client but left this torrent
+	// orphaned (mt.t still on the now-closed client). Match recreateClient's
+	// order: close the old client before building the new one.
+	oldClient := e.client.Load()
+	oldClient.Close()
+	newClient, err := buildTorrentClient(e.cacheDir, e.storage, e.seed)
+	if err != nil {
+		t.Fatalf("buildTorrentClient: %v", err)
+	}
+	e.client.Store(newClient)
+	if mt.t.Load() != oldT {
+		t.Fatal("test setup: handle should still point at the old torrent")
+	}
+
+	// Re-opening the same source must re-bind the handle to the new client.
+	mt2, err := e.Add(context.Background(), torrentPath)
+	if err != nil {
+		t.Fatalf("Add (reopen): %v", err)
+	}
+	if mt2 != mt {
+		t.Fatal("Add returned a different managedTorrent for the same infohash")
+	}
+	newT := mt.t.Load()
+	if newT == oldT {
+		t.Fatal("handle was not re-bound: mt.t still points at the closed-client torrent")
+	}
+	if got := newT.InfoHash().HexString(); got != ih {
+		t.Errorf("re-bound infohash = %s, want %s", got, ih)
+	}
+	if _, ok := e.Status(ih); !ok {
+		t.Error("Status unavailable after re-bind")
+	}
+}
+
+// TestReaddToClient_InfohashFallback exercises the no-full-metainfo branch of
+// readdToClient: it must register a live handle via AddTorrentInfoHash and
+// re-supply the info bytes, so a torrent recovers even when the full-metainfo
+// add path is unavailable.
+func TestReaddToClient_InfohashFallback(t *testing.T) {
+	e := newTestEngine(t)
+	mi := buildV1Metainfo(t)
+	wantIH := mi.HashInfoBytes()
+
+	// hasInfo=false forces the infohash-add + SetInfoBytes fallback.
+	s := reAddSnapshot{ih: wantIH.HexString(), mt: &managedTorrent{}, mi: mi, hasInfo: false}
+	got, ok := e.readdToClient(e.client.Load(), s)
+	if !ok {
+		t.Fatal("readdToClient returned ok=false")
+	}
+	if got == nil {
+		t.Fatal("readdToClient returned a nil handle")
+	}
+	if got.InfoHash() != wantIH {
+		t.Errorf("infohash = %v, want %v", got.InfoHash(), wantIH)
+	}
+	if got.Info() == nil {
+		t.Error("info bytes were not re-supplied: Info() is nil")
+	}
+}
+
+func TestResolveInfohash(t *testing.T) {
+	mi := buildV1Metainfo(t)
+	want := mi.HashInfoBytes()
+
+	// Info bytes present → hash derived from the bytes (map key ignored).
+	if got, ok := resolveInfohash("ignored", &mi); !ok || got != want {
+		t.Errorf("resolveInfohash(with InfoBytes) = %v ok=%v, want %v true", got, ok, want)
+	}
+	// No info bytes → fall back to the hex map key.
+	hexKey := want.HexString()
+	if got, ok := resolveInfohash(hexKey, &metainfo.MetaInfo{}); !ok || got.HexString() != hexKey {
+		t.Errorf("resolveInfohash(hex fallback) = %v ok=%v, want %s true", got, ok, hexKey)
+	}
+	// Neither usable → ok=false.
+	if _, ok := resolveInfohash("not-a-hash", &metainfo.MetaInfo{}); ok {
+		t.Error("resolveInfohash(garbage) ok=true, want false")
 	}
 }
