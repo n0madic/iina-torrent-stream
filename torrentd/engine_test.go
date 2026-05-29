@@ -5,12 +5,16 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/anacrolix/torrent"
+	"github.com/anacrolix/torrent/bencode"
+	"github.com/anacrolix/torrent/metainfo"
 )
 
 func TestIsVideoFile(t *testing.T) {
@@ -301,9 +305,9 @@ func TestRunWarmReader_AppliesRegionSizedReadahead(t *testing.T) {
 	t.Parallel()
 
 	const (
-		fileLen    = 1 << 30        // 1 GiB
-		tailWarm   = 4 << 20        // 4 MiB
-		engineWide = 512 << 20      // 512 MiB — what the bug applied
+		fileLen    = 1 << 30   // 1 GiB
+		tailWarm   = 4 << 20   // 4 MiB
+		engineWide = 512 << 20 // 512 MiB — what the bug applied
 	)
 
 	// Engine with a deliberately large engine-wide readahead, so a regression
@@ -361,9 +365,9 @@ func TestContiguousBytesAheadCore(t *testing.T) {
 	}
 
 	const (
-		piece    int64 = 16 << 20 // 16 MiB pieces
-		fileLen  int64 = 100 << 20
-		fileOff  int64 = 5 * piece // 80 MiB into the torrent
+		piece   int64 = 16 << 20 // 16 MiB pieces
+		fileLen int64 = 100 << 20
+		fileOff int64 = 5 * piece // 80 MiB into the torrent
 	)
 	// File occupies pieces [5..11) (5,6,7,8,9,10) — 6 pieces total.
 	// piece 5: [80, 96) MiB
@@ -382,25 +386,25 @@ func TestContiguousBytesAheadCore(t *testing.T) {
 		want       int64
 	}{
 		{
-			name: "empty: nothing complete",
+			name:     "empty: nothing complete",
 			pieceLen: piece, fileOff: fileOff, fileLen: fileLen,
 			fromOff: 0, numPieces: 12, isComplete: noneComplete,
 			want: 0,
 		},
 		{
-			name: "all complete from start: returns file length",
+			name:     "all complete from start: returns file length",
 			pieceLen: piece, fileOff: fileOff, fileLen: fileLen,
 			fromOff: 0, numPieces: 12, isComplete: allComplete,
 			want: fileLen,
 		},
 		{
-			name: "all complete from middle: returns remaining file bytes",
+			name:     "all complete from middle: returns remaining file bytes",
 			pieceLen: piece, fileOff: fileOff, fileLen: fileLen,
 			fromOff: 50 << 20, numPieces: 12, isComplete: allComplete,
 			want: fileLen - (50 << 20),
 		},
 		{
-			name: "hole at start piece: returns 0 even with later pieces complete",
+			name:     "hole at start piece: returns 0 even with later pieces complete",
 			pieceLen: piece, fileOff: fileOff, fileLen: fileLen,
 			fromOff: 0, numPieces: 12, isComplete: hasHoleAt(5),
 			want: 0,
@@ -424,25 +428,25 @@ func TestContiguousBytesAheadCore(t *testing.T) {
 			want: 32 << 20,
 		},
 		{
-			name: "fromOff past end of file: returns 0",
+			name:     "fromOff past end of file: returns 0",
 			pieceLen: piece, fileOff: fileOff, fileLen: fileLen,
 			fromOff: fileLen, numPieces: 12, isComplete: allComplete,
 			want: 0,
 		},
 		{
-			name: "fromOff way past end of file: returns 0",
+			name:     "fromOff way past end of file: returns 0",
 			pieceLen: piece, fileOff: fileOff, fileLen: fileLen,
 			fromOff: fileLen + (10 << 20), numPieces: 12, isComplete: allComplete,
 			want: 0,
 		},
 		{
-			name: "negative fromOff: returns 0",
+			name:     "negative fromOff: returns 0",
 			pieceLen: piece, fileOff: fileOff, fileLen: fileLen,
 			fromOff: -1, numPieces: 12, isComplete: allComplete,
 			want: 0,
 		},
 		{
-			name: "zero pieceLen: returns 0 (guard against missing metadata)",
+			name:     "zero pieceLen: returns 0 (guard against missing metadata)",
 			pieceLen: 0, fileOff: fileOff, fileLen: fileLen,
 			fromOff: 0, numPieces: 12, isComplete: allComplete,
 			want: 0,
@@ -546,5 +550,73 @@ func TestSelectPrimaryIndex(t *testing.T) {
 		if got := selectPrimaryIndex(c.files); got != c.want {
 			t.Errorf("%s: selectPrimaryIndex = %d, want %d", c.name, got, c.want)
 		}
+	}
+}
+
+// TestRecreateClient_ReAddsV1Torrent is a regression guard for the network-stall
+// watchdog. recreateClient re-adds every tracked torrent to the rebuilt client
+// via t.Metainfo(); for a v1 torrent that reconstructed metainfo carries a
+// non-nil but EMPTY PieceLayers map, which made anacrolix's AddTorrent fail with
+// "no piece root set for file" — silently dropping the torrent so playback and
+// download froze. This builds a real multi-piece v1 torrent, rebuilds the
+// client, and asserts the torrent survives the swap.
+func TestRecreateClient_ReAddsV1Torrent(t *testing.T) {
+	monitor := newResendErrorMonitor(io.Discard)
+	e, err := NewEngine(t.TempDir(), t.TempDir(), readaheadMin, false, monitor)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	defer e.Close()
+
+	// A multi-piece file is required: addPieceLayersLocked only inspects files
+	// whose numPieces() > 1, so a single-piece torrent would not trip the bug.
+	contentFile := filepath.Join(t.TempDir(), "video.bin")
+	if err := os.WriteFile(contentFile, make([]byte, 64<<10), 0o644); err != nil {
+		t.Fatalf("write content: %v", err)
+	}
+	info := metainfo.Info{PieceLength: 16 << 10} // 64 KiB / 16 KiB = 4 pieces
+	private := true                              // hermetic: skip public-tracker announces
+	info.Private = &private
+	if err := info.BuildFromFilePath(contentFile); err != nil {
+		t.Fatalf("BuildFromFilePath: %v", err)
+	}
+	infoBytes, err := bencode.Marshal(info)
+	if err != nil {
+		t.Fatalf("marshal info: %v", err)
+	}
+	mi := metainfo.MetaInfo{InfoBytes: infoBytes}
+	torrentPath := filepath.Join(t.TempDir(), "test.torrent")
+	f, err := os.Create(torrentPath)
+	if err != nil {
+		t.Fatalf("create torrent file: %v", err)
+	}
+	if err := mi.Write(f); err != nil {
+		f.Close()
+		t.Fatalf("write torrent file: %v", err)
+	}
+	f.Close()
+
+	mt, err := e.Add(context.Background(), torrentPath)
+	if err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	oldT := mt.t.Load()
+	if oldT == nil || oldT.Info() == nil {
+		t.Fatal("torrent not loaded with info after Add")
+	}
+	wantIH := oldT.InfoHash()
+
+	// Rebuild the client exactly as the watchdog does on a network stall.
+	e.recreateClient()
+
+	newT := mt.t.Load()
+	if newT == nil {
+		t.Fatal("torrent was dropped: mt.t is nil after recreateClient")
+	}
+	if newT == oldT {
+		t.Fatal("torrent was not re-added: mt.t still points to the old (closed-client) torrent")
+	}
+	if got := newT.InfoHash(); got != wantIH {
+		t.Errorf("re-added torrent infohash = %v, want %v", got, wantIH)
 	}
 }

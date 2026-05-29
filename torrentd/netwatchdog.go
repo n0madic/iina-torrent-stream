@@ -13,10 +13,20 @@ import (
 // to silence it without forking anacrolix is to filter at the writer layer.
 var resendErrorSubstr = []byte("error resending packet:")
 
-// netUnreachSubstr narrows the count to entries that look like a routing-table
-// failure (not e.g. EAGAIN). Recovery is only worth attempting for the routing
-// case — otherwise we would tear down the client on transient buffer hiccups.
-var netUnreachSubstr = []byte("network is unreachable")
+// routingFailureSubstrs narrows the count to entries that look like a
+// routing-table / local-interface failure (not e.g. EAGAIN). Recovery is only
+// worth attempting for these cases — otherwise we would tear down the client
+// on transient buffer hiccups. A resend error matching ANY of these warrants a
+// rebuild:
+//   - "network is unreachable" (ENETUNREACH): the route to the peer is gone.
+//   - "can't assign requested address" (EADDRNOTAVAIL): the local uTP socket is
+//     still bound to an address that no longer exists after a sleep/wake, Wi-Fi
+//     reconnect, or VPN flap. Observed in the wild as the dominant failure when
+//     the network changes underneath a long-running daemon.
+var routingFailureSubstrs = [][]byte{
+	[]byte("network is unreachable"),
+	[]byte("can't assign requested address"),
+}
 
 // resendErrorMonitor wraps an io.Writer and intercepts the uTP resend-failure
 // spam. Matching lines are dropped from the sink (otherwise they drown the
@@ -37,11 +47,22 @@ func newResendErrorMonitor(inner io.Writer) *resendErrorMonitor {
 // theory). The check is on the whole buffer rather than per-line because each
 // resend-error record is a self-contained Write from log.Printf.
 func (m *resendErrorMonitor) Write(p []byte) (int, error) {
-	if bytes.Contains(p, resendErrorSubstr) && bytes.Contains(p, netUnreachSubstr) {
+	if bytes.Contains(p, resendErrorSubstr) && containsRoutingFailure(p) {
 		m.count.Add(1)
 		return len(p), nil
 	}
 	return m.inner.Write(p)
+}
+
+// containsRoutingFailure reports whether p mentions any of the routing-table /
+// interface error strings that warrant a torrent-client rebuild.
+func containsRoutingFailure(p []byte) bool {
+	for _, sub := range routingFailureSubstrs {
+		if bytes.Contains(p, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // LoadAndReset returns the number of suppressed resend errors since the last

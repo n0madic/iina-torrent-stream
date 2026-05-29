@@ -1357,6 +1357,17 @@ func (e *Engine) recreateClient() {
 			err  error
 		)
 		if s.hasInfo {
+			// t.Metainfo() reconstructs PieceLayers via pieceLayers(), which
+			// always allocates a non-nil map even for v1 torrents that have no
+			// piece layers at all. anacrolix's addPieceLayersLocked only
+			// short-circuits on a nil map, so an empty-but-non-nil one makes it
+			// error "no piece root set for file" on every v1 file with >1 piece
+			// — orphaning the torrent on every watchdog rebuild. Drop the empty
+			// map so v1 re-adds cleanly; genuine v2/hybrid layers are non-empty
+			// and preserved.
+			if len(s.mi.PieceLayers) == 0 {
+				s.mi.PieceLayers = nil
+			}
 			newT, err = newClient.AddTorrent(&s.mi)
 		} else {
 			h := s.mi.HashInfoBytes()

@@ -8,27 +8,46 @@ import (
 
 func TestResendErrorMonitor_DropsMatchingLines(t *testing.T) {
 	t.Parallel()
-	var inner bytes.Buffer
-	m := newResendErrorMonitor(&inner)
-
-	// A line that matches BOTH substrings — must be dropped from the sink
-	// and counted.
-	matching := []byte("2026/01/01 12:00:00 error resending packet: write udp4 0.0.0.0:64965->1.2.3.4:6881: sendto: network is unreachable\n")
-	n, err := m.Write(matching)
-	if err != nil {
-		t.Fatalf("Write: unexpected error: %v", err)
+	// Each line carries the resend prefix plus one of the routing-failure
+	// substrings — all must be dropped from the sink and counted.
+	cases := []struct {
+		name string
+		line string
+	}{
+		{
+			name: "ENETUNREACH (network is unreachable)",
+			line: "2026/01/01 12:00:00 error resending packet: write udp4 0.0.0.0:64965->1.2.3.4:6881: sendto: network is unreachable\n",
+		},
+		{
+			name: "EADDRNOTAVAIL (can't assign requested address)",
+			// Observed after a sleep/wake or VPN flap: the local socket is bound
+			// to an address that no longer exists. Must count toward recovery.
+			line: "2026/01/01 12:00:00 error resending packet: write udp4 0.0.0.0:52047->176.98.8.34:41103: sendto: can't assign requested address\n",
+		},
 	}
-	if n != len(matching) {
-		t.Errorf("Write returned %d, want %d (must report full input length even when dropped)", n, len(matching))
-	}
-	if got := inner.Len(); got != 0 {
-		t.Errorf("inner sink received %d bytes, want 0 (line should be dropped)", got)
-	}
-	if got := m.LoadAndReset(); got != 1 {
-		t.Errorf("counter = %d, want 1", got)
-	}
-	if got := m.LoadAndReset(); got != 0 {
-		t.Errorf("counter after reset = %d, want 0", got)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			var inner bytes.Buffer
+			m := newResendErrorMonitor(&inner)
+			matching := []byte(c.line)
+			n, err := m.Write(matching)
+			if err != nil {
+				t.Fatalf("Write: unexpected error: %v", err)
+			}
+			if n != len(matching) {
+				t.Errorf("Write returned %d, want %d (must report full input length even when dropped)", n, len(matching))
+			}
+			if got := inner.Len(); got != 0 {
+				t.Errorf("inner sink received %d bytes, want 0 (line should be dropped)", got)
+			}
+			if got := m.LoadAndReset(); got != 1 {
+				t.Errorf("counter = %d, want 1", got)
+			}
+			if got := m.LoadAndReset(); got != 0 {
+				t.Errorf("counter after reset = %d, want 0", got)
+			}
+		})
 	}
 }
 
