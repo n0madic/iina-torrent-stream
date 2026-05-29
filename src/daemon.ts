@@ -19,7 +19,7 @@ const { http, utils, file, console } = iina;
 // GitHub repository hosting the torrentd release binaries. Release assets must
 // be named `torrentd-darwin-arm64` and `torrentd-darwin-x86_64`.
 const DAEMON_REPO = "n0madic/iina-torrent-stream";
-const DAEMON_VERSION = "v0.1.1";
+const DAEMON_VERSION = "v0.1.2";
 
 const BIN_PATH = "@data/torrentd";
 const STATE_PATH = "@data/torrentd.json";
