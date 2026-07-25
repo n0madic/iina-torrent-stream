@@ -10,6 +10,7 @@
 
 import { opt } from "./options";
 import { diag } from "./log";
+import { SingleFlight, withDaemonToken } from "./plugin-logic";
 import type { CancelFn } from "./util";
 
 const { http, utils, file, console } = iina;
@@ -19,18 +20,22 @@ const { http, utils, file, console } = iina;
 // GitHub repository hosting the torrentd release binaries. Release assets must
 // be named `torrentd-darwin-arm64` and `torrentd-darwin-x86_64`.
 const DAEMON_REPO = "n0madic/iina-torrent-stream";
-const DAEMON_VERSION = "v0.1.2";
+const DAEMON_VERSION = "v0.1.3";
 
 const BIN_PATH = "@data/torrentd";
 const STATE_PATH = "@data/torrentd.json";
+// The daemon's singleton flock; removed by the owner on a clean exit. Its
+// absence — not the state file's — is what tells us the lock is free again.
+const LOCK_PATH = "@data/torrentd.lock";
 // How long the daemon waits, with no heartbeat or status poll from any player
 // window, before it shuts down and purges its disk cache. Kept short so the
 // cache is reclaimed promptly once the last torrent window closes.
 const IDLE_TIMEOUT = "30s";
 
 // SHA-256 checksums of the release binaries, injected at release time by the
-// GitHub Actions workflow (.github/workflows/release.yml). Empty values skip
-// verification, which is the case for local and source builds.
+// GitHub Actions workflow (.github/workflows/release.yml). Empty values are
+// accepted only when an already-installed binary reports version "dev";
+// downloading any executable without a pinned checksum fails closed.
 const EXPECTED_SHA256: Record<string, string> = {
   arm64: "",
   x86_64: "",
@@ -66,10 +71,11 @@ export interface TorrentStatus {
   files: FileStatus[];
 }
 
-interface DaemonState {
+export interface DaemonState {
   port: number;
   pid: number;
   version: string;
+  token: string;
 }
 
 // --- Helpers ----------------------------------------------------------------
@@ -112,11 +118,15 @@ async function detectArch(): Promise<string> {
 }
 
 /** Verifies the downloaded binary against a known checksum, if one is set. */
-async function verifyChecksum(resolvedPath: string, arch: string): Promise<void> {
+async function verifyChecksum(
+  resolvedPath: string,
+  arch: string,
+): Promise<void> {
   const expected = EXPECTED_SHA256[arch];
   if (!expected) {
-    diag(`no expected SHA-256 for ${arch}, skipping verification`);
-    return;
+    throw new Error(
+      `this source build has no pinned SHA-256 for ${arch}; run "make dev-daemon" for local development`,
+    );
   }
   const { status, stdout } = await utils.exec("/usr/bin/shasum", [
     "-a",
@@ -154,6 +164,11 @@ async function probeBinaryVersion(resolved: string): Promise<string | null> {
  * download would otherwise be picked up by the next ensureBinary() call as
  * "already present" and shipped to the user unchecked. */
 async function downloadFreshBinary(arch: string): Promise<string> {
+  if (!EXPECTED_SHA256[arch]) {
+    throw new Error(
+      `this source build has no pinned SHA-256 for ${arch}; run "make dev-daemon" for local development`,
+    );
+  }
   const asset = `torrentd-darwin-${arch}`;
   const url = `https://github.com/${DAEMON_REPO}/releases/download/${DAEMON_VERSION}/${asset}`;
   diag(`downloading ${url}`);
@@ -177,7 +192,11 @@ async function downloadFreshBinary(arch: string): Promise<string> {
   try {
     await verifyChecksum(resolved, arch);
     await utils.exec("/bin/chmod", ["+x", resolved]);
-    await utils.exec("/usr/bin/xattr", ["-dr", "com.apple.quarantine", resolved]);
+    await utils.exec("/usr/bin/xattr", [
+      "-dr",
+      "com.apple.quarantine",
+      resolved,
+    ]);
   } catch (e) {
     // Same logic: if anything in the post-download setup fails we cannot
     // leave a binary on disk that the next call would treat as "ready".
@@ -221,7 +240,9 @@ async function ensureBinary(): Promise<string> {
         /* best-effort */
       }
     } else if (installedVersion === "dev") {
-      diag(`daemon binary is a dev build, skipping version check (${resolved})`);
+      diag(
+        `daemon binary is a dev build, skipping version check (${resolved})`,
+      );
       return resolved;
     } else if (installedVersion !== expectedVersion) {
       diag(
@@ -245,6 +266,7 @@ async function ensureBinary(): Promise<string> {
 // --- Lifecycle --------------------------------------------------------------
 
 let cachedPort: number | null = null;
+const runningFlight = new SingleFlight<number>();
 
 /** Reads the daemon's state file, or returns null if it is absent/invalid.
  * Exported so the main entry can find the running daemon's port without
@@ -259,28 +281,114 @@ function readState(): DaemonState | null {
     const text = file.read(STATE_PATH);
     if (!text) return null;
     const state = JSON.parse(text) as DaemonState;
-    return typeof state.port === "number" && state.port > 0 ? state : null;
+    return typeof state.port === "number" &&
+      state.port > 0 &&
+      state.port <= 65535 &&
+      typeof state.token === "string" &&
+      state.token.length >= 32
+      ? state
+      : null;
   } catch {
     return null;
   }
 }
 
-/** Returns true if a daemon answers /health on the given port. */
-async function isHealthy(port: number): Promise<boolean> {
+/** Returns a port from a pre-token state file so upgrades can retire the old,
+ * unauthenticated daemon instead of waiting for its idle timeout. */
+function readLegacyPort(): number | null {
   try {
-    const res = await http.get(`http://127.0.0.1:${port}/health`, {} as any);
+    if (!file.exists(STATE_PATH)) return null;
+    const text = file.read(STATE_PATH);
+    if (!text) return null;
+    const state = JSON.parse(text) as { port?: unknown; token?: unknown };
+    return typeof state.port === "number" &&
+      state.port > 0 &&
+      state.port <= 65535 &&
+      typeof state.token !== "string"
+      ? state.port
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function retireLegacyDaemon(): Promise<void> {
+  const port = readLegacyPort();
+  if (port === null) return;
+  diag(`retiring legacy unauthenticated daemon on port ${port}`);
+  try {
+    await http.post(`http://127.0.0.1:${port}/shutdown`, {} as any);
+  } catch {
+    // A stale state file or an already-stopped daemon needs no further action.
+  }
+  // The old daemon drains HTTP, closes the engine and purges its cache (with
+  // retries) before it drops the flock, so this can take well over a second.
+  // Wait on the lock file rather than the state file: the state file is
+  // removed first, while the lock is still held, and spawning against a held
+  // lock only gets us an ALREADY-RUNNING no-op.
+  for (let i = 0; i < 50 && file.exists(LOCK_PATH); i++) {
+    await sleep(200);
+  }
+}
+
+function tokenForPort(port: number): string {
+  const state = readState();
+  if (!state || state.port !== port) {
+    throw new Error(`no authenticated daemon state for port ${port}`);
+  }
+  return state.token;
+}
+
+function daemonURL(port: number, path: string, token?: string): string {
+  return `http://127.0.0.1:${port}${withDaemonToken(path, token ?? tokenForPort(port))}`;
+}
+
+/** Returns true if a daemon answers /health on the given port. */
+async function isHealthy(port: number, token?: string): Promise<boolean> {
+  try {
+    const res = await http.get(daemonURL(port, "/health", token), {} as any);
     return res.statusCode === 200;
   } catch {
     return false;
   }
 }
 
+/** How many times spawnDaemon re-tries after losing the singleton lock race. */
+const SPAWN_ATTEMPTS = 3;
+// How long to keep polling after the spawned process exits 0 with
+// ALREADY-RUNNING. The lock owner only has to publish its state file, so a
+// couple of seconds is generous; past that the lock is held by a daemon that
+// will never publish and the spawn has to be retried.
+const ALREADY_RUNNING_GRACE_TICKS = 4;
+
 /**
  * Spawns the daemon and waits for it to become reachable. The daemon enforces
  * a single instance per data directory via a lock file, so spawning a second
  * time simply attaches to the already-running one.
+ *
+ * A spawn that loses the lock race exits 0 with ALREADY-RUNNING without
+ * starting anything. That is expected when the lock owner is merely slow to
+ * publish its state file, but it is terminal when the owner is a daemon on its
+ * way out (upgrade path: the previous version drains and purges before it
+ * drops the flock). Retrying the spawn covers the second case, which would
+ * otherwise leave the first magnet open after an upgrade hanging for the whole
+ * poll budget and then failing with a "did not start in time" that is not what
+ * actually happened.
  */
 async function spawnDaemon(): Promise<number> {
+  for (let attempt = 1; attempt <= SPAWN_ATTEMPTS; attempt++) {
+    const port = await spawnDaemonOnce();
+    if (port !== null) return port;
+    diag(
+      `daemon lock still held (attempt ${attempt}/${SPAWN_ATTEMPTS}); respawning`,
+    );
+  }
+  throw new Error("the torrent engine did not start in time");
+}
+
+/** One spawn attempt. Returns the ready port, or null when the process exited
+ * 0 without any daemon becoming reachable (lock held by someone else). */
+async function spawnDaemonOnce(): Promise<number | null> {
   const bin = await ensureBinary();
   // IINA's parsePath only recognises the prefix form with a trailing slash
   // ("@data/"), not a bare "@data".
@@ -315,7 +423,9 @@ async function spawnDaemon(): Promise<number> {
   utils
     // Daemon stderr goes to the IINA console only — not the diagnostic file —
     // so verbose engine logging cannot flood and truncate our own diag lines.
-    .exec(bin, args, null, null, (errData) => console.log(`[torrentd] ${errData.trim()}`))
+    .exec(bin, args, null, null, (errData) =>
+      console.log(`[torrentd] ${errData.trim()}`),
+    )
     .then((res) => {
       daemonExited = true;
       if (res.status !== 0) {
@@ -333,33 +443,51 @@ async function spawnDaemon(): Promise<number> {
     });
 
   // Poll the state file and /health until the daemon is ready (~15s budget).
+  let exitedZeroAt = -1;
   for (let i = 0; i < 30; i++) {
     await sleep(500);
-    if (daemonExited) {
-      throw new Error(`torrent engine exited before becoming ready (${exitInfo})`);
-    }
     const state = readState();
-    if (state && (await isHealthy(state.port))) {
+    if (state && (await isHealthy(state.port, state.token))) {
       diag(`daemon ready on port ${state.port}`);
       return state.port;
+    }
+    if (!daemonExited) continue;
+    // Only a non-zero/exceptional exit is an immediate, unrecoverable failure.
+    if (exitInfo !== "exit 0") {
+      throw new Error(
+        `torrent engine exited before becoming ready (${exitInfo})`,
+      );
+    }
+    // ALREADY-RUNNING: keep polling briefly in case the lock owner is just
+    // slow to publish its state file, then hand back to spawnDaemon to retry.
+    if (exitedZeroAt < 0) {
+      exitedZeroAt = i;
+    } else if (i - exitedZeroAt >= ALREADY_RUNNING_GRACE_TICKS) {
+      return null;
     }
   }
   throw new Error("the torrent engine did not start in time");
 }
 
 /** Returns the port of a running daemon, starting one if necessary. */
-export async function ensureRunning(): Promise<number> {
+async function ensureRunningOnce(): Promise<number> {
   if (cachedPort !== null && (await isHealthy(cachedPort))) {
     return cachedPort;
   }
   const existing = readState();
-  if (existing && (await isHealthy(existing.port))) {
+  if (existing && (await isHealthy(existing.port, existing.token))) {
     diag(`attached to running daemon on port ${existing.port}`);
     cachedPort = existing.port;
     return cachedPort;
   }
+  await retireLegacyDaemon();
   cachedPort = await spawnDaemon();
   return cachedPort;
+}
+
+/** Returns the port of a running daemon. Concurrent callers share one start. */
+export function ensureRunning(): Promise<number> {
+  return runningFlight.run(ensureRunningOnce);
 }
 
 // --- HTTP API ---------------------------------------------------------------
@@ -392,7 +520,7 @@ export async function addTorrent(
 ): Promise<TorrentStatus> {
   if (isCancelled?.()) throw new Error("addTorrent cancelled before request");
 
-  const url = `http://127.0.0.1:${port}/torrents?source=${encodeURIComponent(source)}`;
+  const url = daemonURL(port, `/torrents?source=${encodeURIComponent(source)}`);
   diag(`POST /torrents source=${source}`);
   const res = await http.post(url, {} as any);
   if (res.statusCode !== 200) {
@@ -400,7 +528,9 @@ export async function addTorrent(
   }
   const stub = JSON.parse(res.text) as TorrentStatus;
   if (stub.files && stub.files.length > 0) {
-    diag(`torrent added: ${stub.name} (${stub.files.length} files, metadata immediate)`);
+    diag(
+      `torrent added: ${stub.name} (${stub.files.length} files, metadata immediate)`,
+    );
     return stub;
   }
 
@@ -424,10 +554,18 @@ export async function addTorrent(
 }
 
 /** Fetches a torrent's status snapshot, or null on any failure. */
-export async function getStatus(port: number, infohash: string): Promise<TorrentStatus | null> {
+export async function getStatus(
+  port: number,
+  infohash: string,
+): Promise<TorrentStatus | null> {
   try {
-    const res = await http.get(`http://127.0.0.1:${port}/torrents/${infohash}`, {} as any);
-    return res.statusCode === 200 ? (JSON.parse(res.text) as TorrentStatus) : null;
+    const res = await http.get(
+      daemonURL(port, `/torrents/${infohash}`),
+      {} as any,
+    );
+    return res.statusCode === 200
+      ? (JSON.parse(res.text) as TorrentStatus)
+      : null;
   } catch {
     return null;
   }
@@ -436,7 +574,7 @@ export async function getStatus(port: number, infohash: string): Promise<Torrent
 /** Sends a keepalive so the daemon does not idle-shut-down during playback. */
 export async function heartbeat(port: number): Promise<void> {
   try {
-    await http.post(`http://127.0.0.1:${port}/heartbeat`, {} as any);
+    await http.post(daemonURL(port, "/heartbeat"), {} as any);
   } catch {
     // A missed heartbeat is non-fatal; the next tick will retry.
   }
@@ -445,18 +583,24 @@ export async function heartbeat(port: number): Promise<void> {
 /** Suspends look-ahead downloading on a torrent. In-flight chunk requests still
  * complete, but no new pieces are prioritised — so a paused viewer is not
  * silently consuming bandwidth for content that may never be watched. */
-export async function pauseTorrent(port: number, infohash: string): Promise<void> {
+export async function pauseTorrent(
+  port: number,
+  infohash: string,
+): Promise<void> {
   try {
-    await http.post(`http://127.0.0.1:${port}/torrents/${infohash}/pause`, {} as any);
+    await http.post(daemonURL(port, `/torrents/${infohash}/pause`), {} as any);
   } catch {
     // Non-fatal: at worst the daemon keeps prefetching until the next pause.
   }
 }
 
 /** Restores look-ahead downloading on a previously paused torrent. */
-export async function resumeTorrent(port: number, infohash: string): Promise<void> {
+export async function resumeTorrent(
+  port: number,
+  infohash: string,
+): Promise<void> {
   try {
-    await http.post(`http://127.0.0.1:${port}/torrents/${infohash}/resume`, {} as any);
+    await http.post(daemonURL(port, `/torrents/${infohash}/resume`), {} as any);
   } catch {
     // Non-fatal: the next status poll keeps the daemon aware the viewer is back.
   }
@@ -484,12 +628,12 @@ export async function warmNext(
   afterIdx: number,
   currentOffset?: number,
 ): Promise<WarmNextResult> {
-  let url = `http://127.0.0.1:${port}/torrents/${infohash}/warm-next?after=${afterIdx}`;
+  let path = `/torrents/${infohash}/warm-next?after=${afterIdx}`;
   if (typeof currentOffset === "number" && currentOffset > 0) {
-    url += `&current_offset=${Math.floor(currentOffset)}`;
+    path += `&current_offset=${Math.floor(currentOffset)}`;
   }
   try {
-    const res = await http.post(url, {} as any);
+    const res = await http.post(daemonURL(port, path), {} as any);
     if (res.statusCode !== 200) {
       return { nextIndex: -1, started: false, deferred: false };
     }
@@ -512,7 +656,7 @@ export async function warmNext(
  * redirect mpv with `core.open()`.
  */
 export function playURL(port: number, source: string): string {
-  return `http://127.0.0.1:${port}/play?source=${encodeURIComponent(source)}`;
+  return daemonURL(port, `/play?source=${encodeURIComponent(source)}`);
 }
 
 /**
@@ -526,8 +670,8 @@ export function streamURL(
   fileIndex: number,
   name?: string,
 ): string {
-  const base = `http://127.0.0.1:${port}/stream/${infohash}/${fileIndex}`;
-  return name ? `${base}/${encodeURIComponent(name)}` : base;
+  const path = `/stream/${infohash}/${fileIndex}${name ? `/${encodeURIComponent(name)}` : ""}`;
+  return daemonURL(port, path);
 }
 
 /**
@@ -548,7 +692,7 @@ export async function prewarmFile(
 ): Promise<string | null> {
   try {
     const res = await http.post(
-      `http://127.0.0.1:${port}/torrents/${infohash}/files/${fileIndex}/prewarm`,
+      daemonURL(port, `/torrents/${infohash}/files/${fileIndex}/prewarm`),
       {} as any,
     );
     if (res.statusCode !== 200) return null;

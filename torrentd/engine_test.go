@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -152,7 +153,11 @@ func TestLoadRemoteMetainfo_RejectsOversizedBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := loadRemoteMetainfo(context.Background(), srv.URL)
+	_, err := loadRemoteMetainfoWithClient(
+		context.Background(),
+		srv.URL,
+		newMetainfoHTTPClient(srv.Client().Transport),
+	)
 	if err == nil {
 		t.Fatal("expected error for oversized body, got nil")
 	}
@@ -167,7 +172,11 @@ func TestLoadRemoteMetainfo_RejectsTooManyRedirects(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := loadRemoteMetainfo(context.Background(), srv.URL)
+	_, err := loadRemoteMetainfoWithClient(
+		context.Background(),
+		srv.URL,
+		newMetainfoHTTPClient(srv.Client().Transport),
+	)
 	if err == nil {
 		t.Fatal("expected error for redirect loop, got nil")
 	}
@@ -183,12 +192,55 @@ func TestLoadRemoteMetainfo_RejectsNon200(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := loadRemoteMetainfo(context.Background(), srv.URL)
+	_, err := loadRemoteMetainfoWithClient(
+		context.Background(),
+		srv.URL,
+		newMetainfoHTTPClient(srv.Client().Transport),
+	)
 	if err == nil {
 		t.Fatal("expected error for 404, got nil")
 	}
 	if !strings.Contains(err.Error(), "404") {
 		t.Errorf("expected HTTP 404 in error, got: %v", err)
+	}
+}
+
+func TestLoadRemoteMetainfo_RejectsLoopbackSSRF(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("production metainfo client reached a loopback server")
+	}))
+	defer srv.Close()
+
+	_, err := loadRemoteMetainfo(context.Background(), srv.URL)
+	if err == nil {
+		t.Fatal("expected loopback URL to be rejected")
+	}
+	if !strings.Contains(err.Error(), "private or local") {
+		t.Fatalf("unexpected loopback rejection: %v", err)
+	}
+}
+
+func TestIsPublicRemoteIP(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		raw  string
+		want bool
+	}{
+		{"8.8.8.8", true},
+		{"1.1.1.1", true},
+		{"127.0.0.1", false},
+		{"10.0.0.1", false},
+		{"169.254.169.254", false},
+		{"192.168.1.10", false},
+		{"100.64.0.1", false},
+		{"::1", false},
+		{"fc00::1", false},
+	}
+	for _, tc := range cases {
+		if got := isPublicRemoteIP(net.ParseIP(tc.raw)); got != tc.want {
+			t.Errorf("isPublicRemoteIP(%s) = %v, want %v", tc.raw, got, tc.want)
+		}
 	}
 }
 
@@ -256,6 +308,30 @@ type fakeReader struct {
 	responsiveCalls int
 	seekCalls       []int64
 	closed          bool
+}
+
+type blockingReader struct {
+	*fakeReader
+	started   chan struct{}
+	done      chan struct{}
+	once      sync.Once
+	closeOnce sync.Once
+}
+
+func (r *blockingReader) ReadContext(ctx context.Context, _ []byte) (int, error) {
+	r.once.Do(func() { close(r.started) })
+	<-ctx.Done()
+	return 0, ctx.Err()
+}
+
+func (r *blockingReader) Close() error {
+	err := r.fakeReader.Close()
+	r.closeOnce.Do(func() {
+		if r.done != nil {
+			close(r.done)
+		}
+	})
+	return err
 }
 
 func (f *fakeReader) SetContext(context.Context) {}
@@ -328,7 +404,7 @@ func TestRunWarmReader_AppliesRegionSizedReadahead(t *testing.T) {
 	// Pre-seed the flag exactly like warmRegionAsync would, then run the
 	// worker synchronously so we can assert on it without timing.
 	region.flag[0] = true
-	e.runWarmReader(mt, fr, region, 0)
+	e.runWarmReader(mt, fr, region, 0, context.Background())
 
 	fr.mu.Lock()
 	defer fr.mu.Unlock()
@@ -346,6 +422,145 @@ func TestRunWarmReader_AppliesRegionSizedReadahead(t *testing.T) {
 	}
 	if len(fr.seekCalls) != 1 || fr.seekCalls[0] != int64(fileLen-tailWarm) {
 		t.Errorf("seek calls = %v, want [%d]", fr.seekCalls, fileLen-tailWarm)
+	}
+}
+
+func TestPauseResumeUpdatesReaderReadahead(t *testing.T) {
+	const intended = 64 << 20
+	reader := &fakeReader{}
+	mt := &managedTorrent{
+		readers:      []managedReader{{reader: reader, readahead: intended}},
+		lastActiveAt: time.Now(),
+	}
+	e := &Engine{torrents: map[string]*managedTorrent{"abc": mt}}
+
+	if !e.Pause("abc") {
+		t.Fatal("Pause returned false")
+	}
+	if !e.Resume("abc") {
+		t.Fatal("Resume returned false")
+	}
+
+	reader.mu.Lock()
+	defer reader.mu.Unlock()
+	if got := reader.readaheadCalls; len(got) != 2 || got[0] != 0 || got[1] != intended {
+		t.Fatalf("readahead calls = %v, want [0 %d]", got, intended)
+	}
+}
+
+// A re-open must clear a pause left over from the previous playback session:
+// the plugin stops tracking a player before the window closes, so its
+// "unpaused" event never arrives and nothing else would reset the flag.
+func TestResumeLockedClearsPauseOnReopen(t *testing.T) {
+	const intended = 64 << 20
+	reader := &fakeReader{}
+	mt := &managedTorrent{
+		readers:      []managedReader{{reader: reader, readahead: intended}},
+		lastActiveAt: time.Now(),
+	}
+	e := &Engine{torrents: map[string]*managedTorrent{"abc": mt}}
+
+	if !e.Pause("abc") {
+		t.Fatal("Pause returned false")
+	}
+
+	// What Add does for an already-tracked torrent.
+	e.mu.Lock()
+	e.resumeLocked(mt)
+	e.mu.Unlock()
+
+	if mt.paused {
+		t.Fatal("torrent is still paused after re-open")
+	}
+	if mt.warmCtx == nil || mt.warmCtx.Err() != nil {
+		t.Fatal("re-open did not hand the torrent a live warm context")
+	}
+	reader.mu.Lock()
+	defer reader.mu.Unlock()
+	if got := reader.readaheadCalls; len(got) != 2 || got[0] != 0 || got[1] != intended {
+		t.Fatalf("readahead calls = %v, want [0 %d]", got, intended)
+	}
+}
+
+// resumeLocked on a torrent that is not paused must not swap out a live warm
+// context — that would orphan in-flight warm workers together with their
+// cancel func.
+func TestResumeLockedIsNoOpWhenNotPaused(t *testing.T) {
+	mt := &managedTorrent{lastActiveAt: time.Now()}
+	e := &Engine{torrents: map[string]*managedTorrent{"abc": mt}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mt.warmCtx, mt.cancelWarm = ctx, cancel
+
+	e.mu.Lock()
+	e.resumeLocked(mt)
+	e.mu.Unlock()
+
+	if mt.warmCtx != ctx {
+		t.Fatal("resumeLocked replaced the warm context of a running torrent")
+	}
+}
+
+func TestCloseCancelsAndWaitsForWarmWorker(t *testing.T) {
+	e := newTestEngine(t)
+	mt := &managedTorrent{warmed: map[int]bool{}}
+	reader := &blockingReader{
+		fakeReader: &fakeReader{},
+		started:    make(chan struct{}),
+		done:       make(chan struct{}),
+	}
+	region := warmRegion{name: "head", length: 1, flag: mt.warmed}
+	region.flag[0] = true
+	if !e.startWorker(func() { e.runWarmReader(mt, reader, region, 0, e.ctx) }) {
+		t.Fatal("warm worker was not started")
+	}
+	select {
+	case <-reader.started:
+	case <-time.After(time.Second):
+		t.Fatal("warm worker did not enter ReadContext")
+	}
+
+	e.Close()
+	reader.mu.Lock()
+	closed := reader.closed
+	reader.mu.Unlock()
+	if !closed {
+		t.Fatal("Engine.Close returned before the warm reader closed")
+	}
+}
+
+func TestPauseCancelsWarmWorker(t *testing.T) {
+	e := newTestEngine(t)
+	warmCtx, cancelWarm := context.WithCancel(e.ctx)
+	mt := &managedTorrent{
+		warmed:       map[int]bool{0: true},
+		warmCtx:      warmCtx,
+		cancelWarm:   cancelWarm,
+		lastActiveAt: time.Now(),
+	}
+	e.torrents["abc"] = mt
+	reader := &blockingReader{
+		fakeReader: &fakeReader{},
+		started:    make(chan struct{}),
+		done:       make(chan struct{}),
+	}
+	region := warmRegion{name: "head", length: 1, flag: mt.warmed}
+	if !e.startWorker(func() { e.runWarmReader(mt, reader, region, 0, warmCtx) }) {
+		t.Fatal("warm worker was not started")
+	}
+	select {
+	case <-reader.started:
+	case <-time.After(time.Second):
+		t.Fatal("warm worker did not enter ReadContext")
+	}
+
+	if !e.Pause("abc") {
+		t.Fatal("Pause returned false")
+	}
+	select {
+	case <-reader.done:
+	case <-time.After(time.Second):
+		t.Fatal("Pause did not cancel the warm worker")
 	}
 }
 
@@ -638,6 +853,70 @@ func TestRecreateClient_ReAddsV1Torrent(t *testing.T) {
 	}
 	if got := newT.InfoHash(); got != wantIH {
 		t.Errorf("re-added torrent infohash = %v, want %v", got, wantIH)
+	}
+}
+
+func TestStaleMetadataWaiterCannotDeleteRebuiltTorrent(t *testing.T) {
+	e := newTestEngine(t)
+	mt, err := e.Add(context.Background(), writeV1Torrent(t))
+	if err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	oldT := mt.t.Load()
+	ih := oldT.InfoHash().HexString()
+
+	e.recreateClient()
+	if mt.t.Load() == oldT {
+		t.Fatal("test setup: rebuild did not replace torrent handle")
+	}
+	if e.dropIfCurrent(ih, mt, oldT) {
+		t.Fatal("stale metadata waiter deleted the rebuilt torrent")
+	}
+	if _, ok := e.Status(ih); !ok {
+		t.Fatal("rebuilt torrent disappeared after stale waiter cleanup")
+	}
+}
+
+func TestAddSerializesWithClientRebuild(t *testing.T) {
+	e := newTestEngine(t)
+	path := writeV1Torrent(t)
+
+	start := make(chan struct{})
+	errs := make(chan error, 8)
+	var wg sync.WaitGroup
+	for range 6 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := e.Add(context.Background(), path)
+			errs <- err
+		}()
+	}
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			e.recreateClient()
+			errs <- nil
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent add/rebuild failed: %v", err)
+		}
+	}
+
+	mi, err := metainfo.LoadFromFile(path)
+	if err != nil {
+		t.Fatalf("load metainfo: %v", err)
+	}
+	if _, ok := e.Status(mi.HashInfoBytes().HexString()); !ok {
+		t.Fatal("torrent was orphaned by concurrent add/rebuild")
 	}
 }
 

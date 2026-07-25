@@ -2,6 +2,7 @@ node_modules/
 dist/
 build/
 .parcel-cache/
+.test-dist/
 *.iinaplgz
 .DS_Store
 torrentd/torrentd

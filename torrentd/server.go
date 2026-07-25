@@ -2,26 +2,33 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/pprof"
 	"net/url"
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
 
 // server wires the HTTP API onto the engine and the lifecycle tracker.
 type server struct {
-	engine *Engine
-	lc     *lifecycle
-	mux    *http.ServeMux
+	engine  *Engine
+	lc      *lifecycle
+	mux     *http.ServeMux
+	token   string
+	baseURL string
+	active  sync.WaitGroup
 }
 
-func newServer(engine *Engine, lc *lifecycle, enableDebug bool) *server {
-	s := &server{engine: engine, lc: lc, mux: http.NewServeMux()}
+func newServer(engine *Engine, lc *lifecycle, enableDebug bool, token string) *server {
+	s := &server{engine: engine, lc: lc, mux: http.NewServeMux(), token: token}
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 	s.mux.HandleFunc("POST /torrents", s.handleAddTorrent)
 	s.mux.HandleFunc("GET /torrents/{ih}", s.handleStatus)
@@ -48,9 +55,9 @@ func newServer(engine *Engine, lc *lifecycle, enableDebug bool) *server {
 		// Diagnostic endpoints. /debug/memstats is a cheap JSON snapshot of
 		// runtime memory + live torrent/reader counts; /debug/pprof/* are the
 		// standard Go pprof endpoints for heap/goroutine/CPU profiling
-		// ("go tool pprof http://127.0.0.1:<port>/debug/pprof/heap"). Off by
-		// default — they expose internal process state and should only be on
-		// while actively debugging. The plugin enables them via the
+		// ("go tool pprof http://127.0.0.1:<port>/debug/pprof/heap?token=…").
+		// Off by default — they expose internal process state and should only
+		// be on while actively debugging. The plugin enables them via the
 		// "debugEndpoints" preference (--debug-endpoints CLI flag).
 		s.mux.HandleFunc("GET /debug/memstats", s.handleMemStats)
 		s.mux.HandleFunc("GET /debug/pprof/", pprof.Index)
@@ -60,6 +67,33 @@ func newServer(engine *Engine, lc *lifecycle, enableDebug bool) *server {
 		s.mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
 	}
 	return s
+}
+
+// setPort records the loopback address the daemon actually listens on so
+// handlers can emit absolute URLs. Playlist entries must be absolute: mpv
+// treats a leading "/" as an absolute path and never joins it with the
+// playlist's own URL, and the plugin matches stream URLs against
+// ^http://127.0.0.1:<port>/. Deriving them from the Host header instead would
+// let a request forge the base URL, so the listener's own port is used.
+// Called once before the server starts serving.
+func (s *server) setPort(port int) {
+	s.baseURL = fmt.Sprintf("http://127.0.0.1:%d", port)
+}
+
+func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.active.Add(1)
+	defer s.active.Done()
+	provided := r.URL.Query().Get("token")
+	if len(provided) != len(s.token) ||
+		subtle.ConstantTimeCompare([]byte(provided), []byte(s.token)) != 1 {
+		writeError(w, http.StatusUnauthorized, "invalid daemon token")
+		return
+	}
+	s.mux.ServeHTTP(w, r)
+}
+
+func (s *server) wait() {
+	s.active.Wait()
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -197,28 +231,49 @@ func (s *server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	ih := t.InfoHash().HexString()
 	files := t.Files()
 
-	// Build the list of video file indices to decide single-file vs playlist.
+	// Build the list of video files to decide single-file vs playlist.
 	// isVideoFile matches the same set the plugin's videoFiles() uses on the
 	// client side, so the two views of the torrent agree.
-	var videoIdx []int
+	var entries []m3uEntry
 	for i, f := range files {
 		if isVideoFile(f.DisplayPath()) {
-			videoIdx = append(videoIdx, i)
+			entries = append(entries, m3uEntry{index: i, name: filepath.Base(f.DisplayPath())})
 		}
 	}
-	if len(videoIdx) <= 1 {
+	if len(entries) <= 1 {
 		s.engine.Stream(w, r, ih, primaryIdx)
 		return
 	}
 
 	w.Header().Set("Content-Type", "audio/x-mpegurl")
 	w.WriteHeader(http.StatusOK)
+	s.writeM3U(w, ih, entries)
+}
+
+// m3uEntry is one playable file inside a torrent, as rendered into a playlist.
+type m3uEntry struct {
+	index int
+	name  string
+}
+
+// writeM3U renders the playlist mpv receives for a multi-video torrent.
+//
+// Entry URLs are absolute on purpose. mpv resolves playlist entries against
+// the playlist's own URL, but treats anything starting with "/" as an already
+// absolute path and hands it to the demuxer unchanged — a root-relative entry
+// would be looked up as a local file and fail. The plugin likewise matches
+// stream URLs against ^http://127.0.0.1:<port>/ to find the playing item.
+func (s *server) writeM3U(w io.Writer, ih string, entries []m3uEntry) {
 	fmt.Fprintln(w, "#EXTM3U")
-	for _, i := range videoIdx {
-		name := filepath.Base(files[i].DisplayPath())
-		fmt.Fprintf(w, "#EXTINF:0,%s\n", name)
-		fmt.Fprintf(w, "http://%s/stream/%s/%d/%s\n", r.Host, ih, i, url.PathEscape(name))
+	for _, e := range entries {
+		fmt.Fprintf(w, "#EXTINF:0,%s\n", sanitizeM3UTitle(e.name))
+		fmt.Fprintf(w, "%s/stream/%s/%d/%s?token=%s\n",
+			s.baseURL, ih, e.index, url.PathEscape(e.name), url.QueryEscape(s.token))
 	}
+}
+
+func sanitizeM3UTitle(name string) string {
+	return strings.NewReplacer("\r", " ", "\n", " ").Replace(name)
 }
 
 // handlePrewarm downloads a single file inside a torrent to completion and

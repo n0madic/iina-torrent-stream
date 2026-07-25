@@ -30,9 +30,10 @@ import {
 } from "./torrent";
 import { opt } from "./options";
 import { diag } from "./log";
+import { redactDaemonToken } from "./plugin-logic";
 import { errorMessage, onPluginQueue } from "./util";
 
-const { core, console, mpv, event, sidebar, global, playlist } = iina;
+const { core, console, mpv, event, sidebar, global, playlist, utils } = iina;
 
 diag("index.ts main entry loaded");
 
@@ -140,7 +141,11 @@ function autoTuneDemuxerBuffer(): void {
     // directly without a /stream redirect.
     fileIdx = active.info.primaryIndex;
   }
-  if (!Number.isInteger(fileIdx) || fileIdx < 0 || fileIdx >= active.info.files.length) {
+  if (
+    !Number.isInteger(fileIdx) ||
+    fileIdx < 0 ||
+    fileIdx >= active.info.files.length
+  ) {
     return;
   }
   const file = active.info.files[fileIdx];
@@ -155,7 +160,9 @@ function autoTuneDemuxerBuffer(): void {
     const duration = mpv.getNumber("duration");
     if (!Number.isFinite(duration) || duration <= 0) {
       if (attempts >= DURATION_POLL_ATTEMPTS) {
-        diag(`auto-tune: duration unavailable after ${attempts} polls, keeping default cap`);
+        diag(
+          `auto-tune: duration unavailable after ${attempts} polls, keeping default cap`,
+        );
         return;
       }
       setTimeout(tick, DURATION_POLL_INTERVAL_MS);
@@ -164,7 +171,10 @@ function autoTuneDemuxerBuffer(): void {
     const bytesPerSec = file.length / duration;
     const targetBytes = bytesPerSec * CACHE_SECS * VBR_MULTIPLIER;
     const targetMiB = Math.round(targetBytes / (1 << 20));
-    const clamped = Math.max(DEMUXER_MIN_MIB, Math.min(DEMUXER_MAX_MIB, targetMiB));
+    const clamped = Math.max(
+      DEMUXER_MIN_MIB,
+      Math.min(DEMUXER_MAX_MIB, targetMiB),
+    );
     const mbps = ((bytesPerSec * 8) / 1e6).toFixed(1);
     diag(
       `auto-tune: file idx=${targetIdx} len=${file.length} dur=${duration.toFixed(1)}s ` +
@@ -202,7 +212,11 @@ function clearTimers(): void {
 }
 
 /** Starts the heartbeat and status-polling timers for an active torrent. */
-function startTracking(port: number, info: TorrentStatus, multiVideo: boolean): void {
+function startTracking(
+  port: number,
+  info: TorrentStatus,
+  multiVideo: boolean,
+): void {
   clearTimers();
   active = {
     port,
@@ -242,7 +256,10 @@ function startTracking(port: number, info: TorrentStatus, multiVideo: boolean): 
   // played. Without this, switching playlist items always stalls in
   // buffering — the next file's pieces have priority 0 until mpv opens it.
   if (multiVideo) {
-    progressTimer = setInterval(() => watchProgress(), PROGRESS_POLL_INTERVAL_MS);
+    progressTimer = setInterval(
+      () => watchProgress(),
+      PROGRESS_POLL_INTERVAL_MS,
+    );
   }
 }
 
@@ -261,18 +278,24 @@ function watchProgress(): void {
   const match = STREAM_URL_FILE_IDX_RE.exec(path);
   if (!match) return; // not a daemon /stream URL (e.g. transient /play URL)
   const currentIdx = Number(match[1]);
-  if (!Number.isInteger(currentIdx) || active.warmedAfter.has(currentIdx)) return;
+  if (!Number.isInteger(currentIdx) || active.warmedAfter.has(currentIdx))
+    return;
   // stream-pos is bytes into the file mpv is reading. Pass to the daemon so
   // it can gate the 128 MiB head-warm of the NEXT file on this file's
   // contiguous buffer being healthy.
   const streamPos = mpv.getNumber("stream-pos");
-  const offset = Number.isFinite(streamPos) && streamPos > 0 ? streamPos : undefined;
-  diag(`warm-next request after idx=${currentIdx} at ${percent.toFixed(1)}% offset=${offset ?? "?"}`);
+  const offset =
+    Number.isFinite(streamPos) && streamPos > 0 ? streamPos : undefined;
+  diag(
+    `warm-next request after idx=${currentIdx} at ${percent.toFixed(1)}% offset=${offset ?? "?"}`,
+  );
   const portSnapshot = active.port;
   const ihSnapshot = active.infohash;
   void warmNext(portSnapshot, ihSnapshot, currentIdx, offset).then((result) => {
     if (result.deferred) {
-      diag(`warm-next deferred for idx=${currentIdx} — will retry on next tick`);
+      diag(
+        `warm-next deferred for idx=${currentIdx} — will retry on next tick`,
+      );
       return;
     }
     // Latch in the per-window set so we don't re-fire for the same index on
@@ -281,7 +304,11 @@ function watchProgress(): void {
     // `active` we captured at call time — by the time the promise resolves
     // the user may have switched torrents, in which case the new active set
     // is unrelated and shouldn't be polluted with this index.
-    if (active && active.port === portSnapshot && active.infohash === ihSnapshot) {
+    if (
+      active &&
+      active.port === portSnapshot &&
+      active.infohash === ihSnapshot
+    ) {
       active.warmedAfter.add(currentIdx);
     }
   });
@@ -375,7 +402,9 @@ async function attachTracking(port: number, infohash: string): Promise<void> {
         try {
           core.subtitle.loadTrack(subPath);
         } catch (e) {
-          console.warn(`could not attach subtitle ${subPath}: ${errorMessage(e)}`);
+          console.warn(
+            `could not attach subtitle ${subPath}: ${errorMessage(e)}`,
+          );
         }
       }
     });
@@ -398,11 +427,18 @@ async function attachTracking(port: number, infohash: string): Promise<void> {
 // owns the progress HUD; we tell it which source we are working on so it can
 // close the HUD once we observe real playback in this window.
 let pendingSource: string | null = null;
+let pendingProgressId: string | null = null;
+const FIRST_FRAME_TIMEOUT_MS = 6 * 60_000;
+
+function newProgressId(): string {
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
 
 function closePendingProgress(): void {
-  if (pendingSource !== null) {
-    global.postMessage("ts-progress-close", { source: pendingSource });
+  if (pendingProgressId !== null) {
+    global.postMessage("ts-progress-close", { progressId: pendingProgressId });
     pendingSource = null;
+    pendingProgressId = null;
   }
   if (firstFramePoller !== null) {
     clearInterval(firstFramePoller);
@@ -424,12 +460,17 @@ let firstFramePoller: string | null = null;
  * .torrent source, and the ts-attach handler that runs in menu-opened
  * windows (where on_load only sees the daemon's /play URL and so couldn't
  * own the HUD-close itself). */
-function startFirstFramePoller(source: string): void {
+function startFirstFramePoller(source: string, progressId: string): void {
   pendingSource = source;
+  pendingProgressId = progressId;
   if (firstFramePoller !== null) clearInterval(firstFramePoller);
+  const deadline = Date.now() + FIRST_FRAME_TIMEOUT_MS;
   firstFramePoller = setInterval(() => {
     if (core.window.visible) {
       diag("progress: player window visible, closing HUD");
+      closePendingProgress();
+    } else if (Date.now() >= deadline) {
+      diag("progress: first-frame timeout, closing HUD");
       closePendingProgress();
     }
   }, 150);
@@ -437,7 +478,7 @@ function startFirstFramePoller(source: string): void {
 
 mpv.addHook("on_load", 10, (next) => {
   const source = mpv.getString("stream-open-filename");
-  diag(`on_load: ${source}`);
+  diag(`on_load: ${redactDaemonToken(source)}`);
 
   // Apply our streaming buffer settings only when this window is actually
   // playing torrent content — either a magnet/.torrent we are about to
@@ -451,10 +492,11 @@ mpv.addHook("on_load", 10, (next) => {
   if (isTorrentSource(source)) {
     const state = readDaemonState();
     if (state) {
+      const progressId = newProgressId();
       mpv.set("stream-open-filename", playURL(state.port, source));
-      global.postMessage("ts-progress-open", { source });
-      startFirstFramePoller(source);
-      void attachAfterResolve(state.port, source);
+      global.postMessage("ts-progress-open", { progressId, source });
+      startFirstFramePoller(source, progressId);
+      void attachAfterResolve(state.port, source, progressId);
     } else {
       diag("on_load: daemon not running yet, forwarding to global");
       global.postMessage("ts-open-source", { source });
@@ -474,17 +516,33 @@ mpv.addHook("on_load", 10, (next) => {
  * If the user closes the window while that's in flight, we tell addTorrent
  * to abort so the daemon stops being polled (and so the polling does not
  * keep the daemon's idle timer touched, holding it alive for nothing). */
-async function attachAfterResolve(port: number, source: string): Promise<void> {
+async function attachAfterResolve(
+  port: number,
+  source: string,
+  progressId: string,
+): Promise<void> {
   try {
     const info = await addTorrent(port, source, () => windowClosed);
     if (windowClosed) {
-      diag("attachAfterResolve: window closed during addTorrent, skipping attach");
+      diag(
+        "attachAfterResolve: window closed during addTorrent, skipping attach",
+      );
       return;
     }
-    global.postMessage("ts-progress-track", { source, port, infohash: info.infohash });
+    global.postMessage("ts-progress-track", {
+      progressId,
+      source,
+      port,
+      infohash: info.infohash,
+    });
     void attachTracking(port, info.infohash);
   } catch (e) {
-    diag(`attachAfterResolve ERROR: ${errorMessage(e)}`);
+    const message = errorMessage(e);
+    diag(`attachAfterResolve ERROR: ${message}`);
+    if (!windowClosed && pendingProgressId === progressId) {
+      closePendingProgress();
+      onPluginQueue(() => utils.ask(`Torrent Stream error: ${message}`));
+    }
   }
 }
 
@@ -495,9 +553,18 @@ async function attachAfterResolve(port: number, source: string): Promise<void> {
 // this for the magnet/.torrent-intercept case.)
 global.onMessage("ts-attach", (data) => {
   diag(`ts-attach received: ${JSON.stringify(data)}`);
-  if (data && typeof data.port === "number" && typeof data.infohash === "string") {
-    if (typeof data.source === "string" && data.source && pendingSource === null) {
-      startFirstFramePoller(data.source);
+  if (
+    data &&
+    typeof data.port === "number" &&
+    typeof data.infohash === "string"
+  ) {
+    if (
+      typeof data.source === "string" &&
+      data.source &&
+      typeof data.progressId === "string" &&
+      pendingSource === null
+    ) {
+      startFirstFramePoller(data.source, data.progressId);
     }
     void attachTracking(data.port, data.infohash);
   }
@@ -549,7 +616,12 @@ function initSidebar(): void {
     if (!active) return;
     const target = active.info.files[index];
     if (!target) return;
-    const url = streamURL(active.port, active.infohash, index, fileBaseName(target.path));
+    const url = streamURL(
+      active.port,
+      active.infohash,
+      index,
+      fileBaseName(target.path),
+    );
     // For a multi-video torrent (an mpv playlist) navigate within the playlist
     // so next/previous keep working; otherwise just open the file.
     if (active.multiVideo) {
@@ -560,7 +632,9 @@ function initSidebar(): void {
         // Do NOT fall through to core.open(url) — that would replace the
         // m3u-driven playlist with a single stream URL, destroying the
         // next/previous navigation for the rest of the episodes.
-        diag(`switchFile: URL not in playlist, refusing to break playlist: ${url}`);
+        diag(
+          `switchFile: URL not in playlist, refusing to break playlist: ${redactDaemonToken(url)}`,
+        );
       }
       return;
     }

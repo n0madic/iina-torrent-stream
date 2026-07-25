@@ -6,6 +6,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -72,10 +74,9 @@ func parseFlags() config {
 	flag.BoolVar(&c.seed, "seed", true, "keep seeding while the daemon runs")
 	flag.BoolVar(&c.showVersion, "version", false, "print version and exit")
 	// Diagnostic endpoints (/debug/memstats, /debug/pprof/*) are off by
-	// default — they let any localhost process inspect the daemon's memory
-	// layout and capture profiles, which is a small but unnecessary attack
-	// surface for normal use. Enable from the plugin's preferences when
-	// debugging memory or goroutine issues.
+	// default — even though the API token is required, profiles expose enough
+	// internal state that they should only be enabled while debugging memory
+	// or goroutine issues.
 	flag.BoolVar(&c.debugEndpoints, "debug-endpoints", false, "expose /debug/memstats and /debug/pprof/* for diagnosis")
 	flag.Parse()
 
@@ -180,8 +181,12 @@ func main() {
 		log.Fatalf("start torrent engine: %v", err)
 	}
 
+	apiToken, err := newAPIToken()
+	if err != nil {
+		log.Fatalf("generate API token: %v", err)
+	}
 	lc := newLifecycle(cfg.idleTimeout)
-	srv := newServer(engine, lc, cfg.debugEndpoints)
+	srv := newServer(engine, lc, cfg.debugEndpoints, apiToken)
 	if cfg.debugEndpoints {
 		log.Printf("debug endpoints enabled at /debug/memstats and /debug/pprof/*")
 	}
@@ -191,18 +196,34 @@ func main() {
 		log.Fatalf("listen: %v", err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
+	srv.setPort(port)
 
-	httpServer := &http.Server{Handler: srv.mux}
+	serverCtx, cancelServer := context.WithCancel(context.Background())
+	defer cancelServer()
+	httpServer := &http.Server{
+		Handler:           srv,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+		BaseContext: func(net.Listener) context.Context {
+			return serverCtx
+		},
+	}
+	if err := writeState(cfg.stateFile, port, apiToken); err != nil {
+		log.Printf("write state file: %v; aborting unusable daemon", err)
+		_ = ln.Close()
+		cancelServer()
+		engine.Close()
+		return
+	}
+
 	go func() {
 		if serveErr := httpServer.Serve(ln); serveErr != nil && serveErr != http.ErrServerClosed {
 			log.Printf("http server: %v", serveErr)
 			lc.trigger()
 		}
 	}()
-
-	if err := writeState(cfg.stateFile, port); err != nil {
-		log.Printf("warning: write state file: %v", err)
-	}
 
 	log.Printf("listening on 127.0.0.1:%d (readahead %d MiB, cache at %s)", port, cfg.readaheadBytes>>20, cfg.cacheDir)
 
@@ -220,7 +241,13 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	log.Printf("shutdown: stopping HTTP server")
-	_ = httpServer.Shutdown(shutdownCtx)
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("shutdown: graceful HTTP stop failed: %v; cancelling active requests", err)
+		cancelServer()
+		_ = httpServer.Close()
+	}
+	cancelServer()
+	srv.wait()
 	log.Printf("shutdown: closing engine")
 	engine.Close()
 	log.Printf("shutdown: returning from main, deferred cleanup runs next")
@@ -250,18 +277,48 @@ func purgeCacheDir(dir string) {
 }
 
 // writeState records the listening port and PID so the plugin can find the daemon.
-func writeState(path string, port int) error {
+func writeState(path string, port int, token string) error {
 	data, err := json.Marshal(struct {
 		Port    int    `json:"port"`
 		PID     int    `json:"pid"`
 		Version string `json:"version"`
-	}{Port: port, PID: os.Getpid(), Version: version})
+		Token   string `json:"token"`
+	}{Port: port, PID: os.Getpid(), Version: version, Token: token})
 	if err != nil {
 		return err
 	}
-	// 0o600: state file holds the local listening port; on a multi-user Mac
-	// other users have no reason to read this.
-	return os.WriteFile(path, data, 0o600)
+	// Publish atomically so concurrent plugin readers see either the complete
+	// old state or the complete new state, never truncated JSON. The token makes
+	// this file a capability, so both the temporary and final file are 0o600.
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".torrentd-state-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
+}
+
+func newAPIToken() (string, error) {
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw[:]), nil
 }
 
 // acquireLock takes an exclusive non-blocking flock on path. The returned bool

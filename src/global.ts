@@ -68,21 +68,28 @@ let progressOpen = false;
 // webview may not have registered iina.onMessage by the time we post the
 // first update, and there's no reliable "ready" signal that always lands.
 let progressPushTimer: string | null = null;
-// Track in-flight resolves: source -> latest status snapshot (null until the
-// first poll succeeds) + the polling interval id (null when we don't yet
-// know the infohash). The window closes only when the last entry is gone —
-// otherwise opening a second magnet would dismiss the indicator that's
-// still active for the first.
+// Track in-flight resolves by unique operation ID. Each entry stores its source,
+// latest status snapshot (null until the first poll succeeds), and polling
+// interval id (null when we don't yet know the infohash). The window closes
+// only when the last entry is gone — otherwise opening the same magnet twice
+// would let one completion dismiss the other operation's indicator.
 interface ProgressEntry {
+  source: string;
   status: TorrentStatus | null;
   pollTimer: string | null;
 }
 const activeSources = new Map<string, ProgressEntry>();
-// Which source is the HUD currently rendering. Updates re-render only when
+// Which operation the HUD is currently rendering. Updates re-render only when
 // they target the visible entry (we show "latest" so a second open replaces
 // the visible label and stats with the new torrent — the older one keeps
 // the HUD alive but doesn't compete for the visible content).
-let visibleSource: string | null = null;
+let visibleProgressId: string | null = null;
+let progressSequence = 0;
+
+function newProgressId(): string {
+  progressSequence++;
+  return `${Date.now()}-${progressSequence}`;
+}
 
 /** Registers the standaloneWindow message handlers for the current mode.
  * MUST be called AFTER loadFile — see the comment on WindowMode above.
@@ -95,7 +102,9 @@ function registerHandlersFor(mode: "progress" | "magnet-input"): void {
     });
   } else {
     standaloneWindow.onMessage("magnet-submit", (value: unknown) => {
-      diag(`magnet-submit received (len=${typeof value === "string" ? value.length : "non-string"})`);
+      diag(
+        `magnet-submit received (len=${typeof value === "string" ? value.length : "non-string"})`,
+      );
       onMagnetSubmit(typeof value === "string" ? value : "");
     });
     standaloneWindow.onMessage("magnet-cancel", () => {
@@ -146,11 +155,11 @@ function switchWindowMode(mode: "progress" | "magnet-input"): void {
 }
 
 function renderVisible(): void {
-  if (!visibleSource) return;
-  const entry = activeSources.get(visibleSource);
+  if (!visibleProgressId) return;
+  const entry = activeSources.get(visibleProgressId);
   if (!entry) return;
   standaloneWindow.postMessage("update", {
-    source: visibleSource,
+    source: entry.source,
     status: entry.status,
   });
 }
@@ -167,12 +176,12 @@ function stopProgressPush(): void {
   }
 }
 
-function showProgress(source: string): void {
+function showProgress(progressId: string, source: string): void {
   switchWindowMode("progress");
-  if (!activeSources.has(source)) {
-    activeSources.set(source, { status: null, pollTimer: null });
+  if (!activeSources.has(progressId)) {
+    activeSources.set(progressId, { source, status: null, pollTimer: null });
   }
-  visibleSource = source;
+  visibleProgressId = progressId;
   if (!progressOpen) {
     standaloneWindow.open();
     progressOpen = true;
@@ -181,18 +190,18 @@ function showProgress(source: string): void {
   startProgressPush();
 }
 
-function hideProgress(source: string): void {
-  const entry = activeSources.get(source);
+function hideProgress(progressId: string): void {
+  const entry = activeSources.get(progressId);
   if (entry) {
     if (entry.pollTimer !== null) {
       clearInterval(entry.pollTimer);
     }
-    activeSources.delete(source);
+    activeSources.delete(progressId);
   }
-  if (visibleSource === source) {
-    // Pick any remaining source to keep showing; or close if none.
-    visibleSource = activeSources.keys().next().value ?? null;
-    if (visibleSource) renderVisible();
+  if (visibleProgressId === progressId) {
+    // Pick any remaining operation to keep showing; or close if none.
+    visibleProgressId = activeSources.keys().next().value ?? null;
+    if (visibleProgressId) renderVisible();
   }
   if (activeSources.size === 0 && progressOpen) {
     standaloneWindow.close();
@@ -203,18 +212,22 @@ function hideProgress(source: string): void {
 }
 
 /** Starts polling /torrents/{ih} for live stats and feeds the HUD. Idempotent
- * — a repeat start for the same source replaces the previous timer. */
-function startProgressPolling(source: string, port: number, infohash: string): void {
-  const entry = activeSources.get(source);
+ * — a repeat start for the same operation replaces the previous timer. */
+function startProgressPolling(
+  progressId: string,
+  port: number,
+  infohash: string,
+): void {
+  const entry = activeSources.get(progressId);
   if (!entry) return; // showProgress wasn't called (or hideProgress already ran)
   if (entry.pollTimer !== null) clearInterval(entry.pollTimer);
   const tick = async (): Promise<void> => {
     const status = await getStatus(port, infohash);
-    const e = activeSources.get(source);
+    const e = activeSources.get(progressId);
     if (!e) return; // hideProgress ran while the request was in flight
     if (status) {
       e.status = status;
-      if (visibleSource === source) renderVisible();
+      if (visibleProgressId === progressId) renderVisible();
     }
   };
   entry.pollTimer = setInterval(() => void tick(), 1000);
@@ -238,7 +251,11 @@ function startProgressPolling(source: string, port: number, infohash: string): v
  */
 async function sweepOrphanedCache(): Promise<void> {
   try {
-    if (file.exists("@data/torrentd.json") || file.exists("@data/torrentd.lock")) return;
+    if (
+      file.exists("@data/torrentd.json") ||
+      file.exists("@data/torrentd.lock")
+    )
+      return;
     const cacheDir = utils.resolvePath("@tmp/torrent-cache");
     // Defence in depth: if utils.resolvePath ever returns something other
     // than the expected sandbox tmp path we DO NOT pass it to rm -rf.
@@ -257,7 +274,9 @@ async function sweepOrphanedCache(): Promise<void> {
     }
     const res = await utils.exec("/bin/rm", ["-rf", cacheDir]);
     if (res.status !== 0) {
-      diag(`sweepOrphanedCache: rm exit=${res.status} stderr=${res.stderr.trim()}`);
+      diag(
+        `sweepOrphanedCache: rm exit=${res.status} stderr=${res.stderr.trim()}`,
+      );
     }
   } catch (e) {
     diag(`sweepOrphanedCache failed: ${errorMessage(e)}`);
@@ -298,12 +317,13 @@ async function keepDaemonAlive(): Promise<void> {
  * told the infohash and attach its sidebar/subtitles/heartbeat tracking.
  */
 async function resolveAndOpen(source: string): Promise<void> {
+  const progressId = newProgressId();
   let port: number | null = null;
   let failure: string | null = null;
 
   // Show the progress HUD up-front so the user always sees an acknowledgement
   // even when ensureRunning has to spawn the daemon for the first time.
-  onPluginQueue(() => showProgress(source));
+  onPluginQueue(() => showProgress(progressId, source));
 
   try {
     port = await ensureRunning();
@@ -323,7 +343,7 @@ async function resolveAndOpen(source: string): Promise<void> {
     onPluginQueue(() => {
       if (port === null) {
         diag(`global: ERROR ${failure}`);
-        hideProgress(source);
+        hideProgress(progressId);
         utils.ask(`Torrent Stream error: ${failure}`);
         resolve(null);
         return;
@@ -344,25 +364,37 @@ async function resolveAndOpen(source: string): Promise<void> {
   // for an already-added torrent (anacrolix returns the existing one) so
   // this races safely with the /play handler's own Add call.
   //
-  // The cancel callback flips true once hideProgress removes the source from
-  // activeSources — which happens on window-will-close (via ts-progress-close)
-  // and on any other dismissal. That stops addTorrent's metadata polling so
+  // The cancel callback flips true once hideProgress removes this operation
+  // from activeSources — which happens on window-will-close (via
+  // ts-progress-close) and on any other dismissal. That stops metadata polling so
   // we are not heartbeating the daemon on behalf of a window the user has
   // already abandoned.
   try {
-    const info = await addTorrent(port, source, () => !activeSources.has(source));
+    const info = await addTorrent(
+      port,
+      source,
+      () => !activeSources.has(progressId),
+    );
     // We have the infohash now — start feeding live stats into the HUD.
-    onPluginQueue(() => startProgressPolling(source, port!, info.infohash));
-    // `source` tells the new window's main entry which progress HUD entry
+    onPluginQueue(() => startProgressPolling(progressId, port!, info.infohash));
+    // `progressId` tells the new window's main entry which progress HUD entry
     // it should close once playback actually starts. For the on_load
-    // intercept path the main entry already owns the source (it's the
-    // string it intercepted), but for this menu path it had no way to
-    // know the original magnet/.torrent URL.
-    global.postMessage(playerId, "ts-attach", { port, infohash: info.infohash, source });
+    // intercept path the main entry already owns the operation, but for this
+    // menu path it had no way to know the unique ID assigned by this entry.
+    global.postMessage(playerId, "ts-attach", {
+      port,
+      infohash: info.infohash,
+      source,
+      progressId,
+    });
     diag(`global: sent ts-attach to player ${playerId}`);
   } catch (e) {
-    diag(`global: addTorrent failed: ${errorMessage(e)}`);
-    onPluginQueue(() => hideProgress(source));
+    const message = errorMessage(e);
+    diag(`global: addTorrent failed: ${message}`);
+    onPluginQueue(() => {
+      hideProgress(progressId);
+      utils.ask(`Torrent Stream error: ${message}`);
+    });
   }
   // Note: we do NOT hideProgress in the success case here. The HUD stays
   // open until the new player window's main entry reports playback started
@@ -390,7 +422,9 @@ function finishMagnetDialog(value: string | null): void {
   }
   const resolve = pendingMagnetResolve;
   pendingMagnetResolve = null;
-  diag(`finishMagnetDialog: resolving with ${value === null ? "<null>" : `value len=${value.length}`}`);
+  diag(
+    `finishMagnetDialog: resolving with ${value === null ? "<null>" : `value len=${value.length}`}`,
+  );
   onPluginQueue(() => {
     standaloneWindow.close();
     windowMode = "none";
@@ -463,14 +497,18 @@ function showMagnetInputDialog(): Promise<string | null> {
 async function openMagnetLink(): Promise<void> {
   diag("menu: Open Magnet Link clicked");
   const source = await showMagnetInputDialog();
-  diag(`openMagnetLink: dialog resolved with ${source ? `source len=${source.length}` : "<null/empty>"}`);
+  diag(
+    `openMagnetLink: dialog resolved with ${source ? `source len=${source.length}` : "<null/empty>"}`,
+  );
   if (source) await resolveAndOpen(source);
 }
 
 async function openTorrentFile(): Promise<void> {
   diag("menu: Open Torrent File clicked");
   const path = await Promise.resolve(
-    utils.chooseFile("Select a .torrent file", { allowedFileTypes: ["torrent"] }),
+    utils.chooseFile("Select a .torrent file", {
+      allowedFileTypes: ["torrent"],
+    }),
   );
   if (path) await resolveAndOpen(path);
 }
@@ -493,8 +531,12 @@ global.onMessage("ts-open-source", (data) => {
 // /play URL into the existing window and IINA's player NSWindow won't
 // un-hide until the first decoded frame). The HUD bridges the gap.
 global.onMessage("ts-progress-open", (data) => {
-  if (data && typeof data.source === "string") {
-    onPluginQueue(() => showProgress(data.source));
+  if (
+    data &&
+    typeof data.progressId === "string" &&
+    typeof data.source === "string"
+  ) {
+    onPluginQueue(() => showProgress(data.progressId, data.source));
   }
 });
 // Main entry tells us the infohash once addTorrent comes back, so we can
@@ -502,16 +544,19 @@ global.onMessage("ts-progress-open", (data) => {
 global.onMessage("ts-progress-track", (data) => {
   if (
     data &&
+    typeof data.progressId === "string" &&
     typeof data.source === "string" &&
     typeof data.port === "number" &&
     typeof data.infohash === "string"
   ) {
-    onPluginQueue(() => startProgressPolling(data.source, data.port, data.infohash));
+    onPluginQueue(() =>
+      startProgressPolling(data.progressId, data.port, data.infohash),
+    );
   }
 });
 global.onMessage("ts-progress-close", (data) => {
-  if (data && typeof data.source === "string") {
-    onPluginQueue(() => hideProgress(data.source));
+  if (data && typeof data.progressId === "string") {
+    onPluginQueue(() => hideProgress(data.progressId));
   }
 });
 
@@ -525,7 +570,9 @@ setInterval(() => void sweepOrphanedCache(), 60_000);
 // IINA's Welcome / Recent / drag-drop falls back to opening a fresh window
 // via the global entry. The await is fire-and-forget; failures surface via
 // the normal /play / addTorrent error paths once a torrent is opened.
-void ensureRunning().catch((e) => diag(`eager ensureRunning failed: ${errorMessage(e)}`));
+void ensureRunning().catch((e) =>
+  diag(`eager ensureRunning failed: ${errorMessage(e)}`),
+);
 // Keep the daemon alive for the lifetime of the IINA process. Daemon's
 // idleTimeout is 30s, so anything well under that works; 10s gives plenty
 // of slack against a momentarily-blocked event loop.

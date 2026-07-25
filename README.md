@@ -21,7 +21,7 @@ Instead this project has two parts:
  index.ts    on_load hook intercepts
              magnet: / *.torrent
              │  spawn via utils.exec ─────────► HTTP API on 127.0.0.1:<port>
-             │  GET /play?source=... ─────────► ├─ anacrolix/torrent engine
+             │  GET /play?source=...&token=… ─► ├─ anacrolix/torrent engine
              │  (one URL: metadata + stream)    ├─ ephemeral scratch cache
              │                                  ├─ tracker / DHT / UPnP
              ▼                                  └─ GET /stream — Range 206
@@ -39,6 +39,9 @@ Instead this project has two parts:
   support. Range requests are what make **seeking** work: when you drag the seek
   bar, mpv requests a new byte range and the engine instantly re-prioritises the
   pieces around that position.
+- **The localhost API is authenticated** with a fresh random capability token
+  stored in the plugin-private state file. Requests without that token are
+  rejected, including health and diagnostic endpoints.
 
 Seeking and buffering specifics:
 
@@ -47,7 +50,8 @@ Seeking and buffering specifics:
 - **Buffering** — the reader keeps a configurable read-ahead window (default
   512 MiB, clamped to 256–2048 MiB) so the whole peer swarm stays busy, the
   file tail is fetched eagerly (so MP4 `moov` atoms at end-of-file do not stall
-  startup), and mpv's own demuxer cache is enlarged.
+  startup), and mpv's own demuxer cache is enlarged. Pausing playback disables
+  torrent look-ahead and background warming until playback resumes.
 - **Ephemeral cache** — downloaded pieces are written to a temporary scratch
   directory. The daemon shuts down and purges that directory shortly after the
   last player window closes, so downloaded data does not linger on disk.
@@ -80,14 +84,18 @@ make dev-daemon   # build torrentd for this Mac and install it locally
 ```
 
 Then restart IINA and enable the plugin. `make dev-daemon` installs the engine
-locally so development needs no network and no GitHub release.
+locally so development needs no network and no GitHub release. Source packages
+with blank daemon checksums fail closed: `make package` is reserved for the
+release workflow, which injects SHA-256 values before packaging.
 
 ## Usage
 
 - **Magnet link** — open it with IINA (e.g. from your browser), or use
   **Plugins → Torrent Stream → Open Magnet Link…** and paste it.
 - **.torrent file** — open it with IINA, or use **Open Torrent File…**.
-- **Remote .torrent URL** — opening an `http(s)://…/file.torrent` URL works too.
+- **Remote .torrent URL** — opening a public `http(s)://…/file.torrent` URL
+  works too. Private, loopback, link-local, and carrier-grade NAT targets are
+  rejected to prevent localhost API requests from becoming an SSRF proxy.
 
 For multi-video torrents (season packs) every episode is added to the playlist.
 The **Torrent** sidebar shows live download speed, peers, and the file list;
@@ -97,13 +105,13 @@ click any video file there to switch to it.
 
 Found under **Settings → Plugins → Torrent Stream**:
 
-| Setting | Default | Description |
-|---|---|---|
-| Read-ahead window | 512 MiB | How far ahead the engine downloads (clamped 256–2048 MiB). Not a disk cap. Raise it if playback stalls on a slow swarm. |
-| In-player buffer | 256 MiB | mpv `demuxer-max-bytes` — larger smooths slow swarms. |
-| Keep seeding | on | Upload back to the swarm while the engine runs. |
-| Show sidebar automatically | off | Reveal the Torrent sidebar on playback start. |
-| Enable diagnostic endpoints | off | Expose `/debug/memstats` and `/debug/pprof/*` on the daemon for memory/CPU diagnosis. Restart IINA after toggling. |
+| Setting                     | Default | Description                                                                                                             |
+| --------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Read-ahead window           | 512 MiB | How far ahead the engine downloads (clamped 256–2048 MiB). Not a disk cap. Raise it if playback stalls on a slow swarm. |
+| In-player buffer            | 256 MiB | mpv `demuxer-max-bytes` — larger smooths slow swarms.                                                                   |
+| Keep seeding                | on      | Upload back to the swarm while the engine runs.                                                                         |
+| Show sidebar automatically  | off     | Reveal the Torrent sidebar on playback start.                                                                           |
+| Enable diagnostic endpoints | off     | Expose `/debug/memstats` and `/debug/pprof/*` on the daemon for memory/CPU diagnosis. Restart IINA after toggling.      |
 
 ## Building
 
@@ -165,11 +173,12 @@ progress.html            HUD shown while resolving torrent metadata
 magnet-input.html        wide input dialog for the "Open Magnet Link…" menu
 torrentd/                the native Go daemon
   main.go                CLI flags, lifecycle, lock, log, cache purge
-  server.go              HTTP API + diagnostic endpoints
+  server.go              authenticated HTTP API + diagnostic endpoints
   engine.go              anacrolix wrapper, per-torrent GC, stream/prewarm
   storage.go             anacrolix file storage backend
   lifecycle.go           idle-timeout monitor
-  engine_test.go         unit tests
+  engine_test.go         engine concurrency, lifecycle, and SSRF tests
+  server_test.go         API authentication and playlist-safety tests
 LICENSE / NOTICE         MIT (plugin) + MPL-2.0 attribution for daemon deps
 .github/workflows/       release.yml — tag-push → GitHub Release
 ```
@@ -194,9 +203,9 @@ LICENSE / NOTICE         MIT (plugin) + MPL-2.0 attribution for daemon deps
 
   For deeper inspection, enable **Settings → Plugins → Torrent Stream →
   Enable diagnostic endpoints** and restart IINA. The daemon then exposes
-  `http://127.0.0.1:<port>/debug/memstats` (cheap JSON snapshot) and the
-  standard Go `/debug/pprof/heap`, `/debug/pprof/goroutine`, etc. The port
-  is in
+  `http://127.0.0.1:<port>/debug/memstats?token=<token>` (cheap JSON snapshot)
+  and the standard Go `/debug/pprof/heap`, `/debug/pprof/goroutine`, etc.,
+  each with the same `token` query parameter. Both the port and token are in
   `~/Library/Application Support/com.colliderli.iina/plugins/.data/com.github.n0madic.iina-torrent-stream/torrentd.json`.
 
 ## Legal

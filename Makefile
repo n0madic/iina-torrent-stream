@@ -14,7 +14,7 @@ DEV_LINK     := $(IINA_PLUGINS)/$(PLUGIN_NAME).iinaplugin-dev
 VERSION      ?= dev
 GO_LDFLAGS   := -s -w -X main.version=$(VERSION)
 
-.PHONY: all plugin daemon daemon-release dev-daemon dev dev-uninstall package test clean help
+.PHONY: all plugin daemon daemon-release dev-daemon dev dev-uninstall check-release-config package test clean help
 
 help:
 	@echo "Targets:"
@@ -25,7 +25,7 @@ help:
 	@echo "  dev            Build the plugin and symlink it into IINA for development"
 	@echo "  dev-uninstall  Remove the IINA dev-plugin symlink (does not touch the data dir)"
 	@echo "  package        Build everything and create the .iinaplgz package"
-	@echo "  test           Run the daemon's Go test suite"
+	@echo "  test           Run plugin logic and daemon Go test suites"
 	@echo "  clean          Remove all build artifacts"
 
 all: plugin daemon
@@ -87,8 +87,17 @@ dev-uninstall:
 	@echo "To also wipe the data dir (binary, logs, state):"
 	@echo "  rm -rf \"$(DATA_DIR)\""
 
+## Refuse distributable builds that would download and execute an unpinned
+## daemon. The release workflow injects both checksums before this target.
+check-release-config:
+	@if grep -Eq 'arm64: ""|x86_64: ""' src/daemon.ts; then \
+		echo "error: release daemon SHA-256 checksums are empty"; \
+		echo "use 'make dev' + 'make dev-daemon' locally, or inject release checksums"; \
+		exit 1; \
+	fi
+
 ## Create the distributable .iinaplgz package.
-package: plugin
+package: check-release-config plugin
 	rm -rf build/pkg "$(PLUGIN_NAME).iinaplgz"
 	mkdir -p build/pkg
 	cp -R Info.json dist *.html README.md LICENSE NOTICE build/pkg/
@@ -96,8 +105,9 @@ package: plugin
 	cd build/pkg && zip -r -X "../../$(PLUGIN_NAME).iinaplgz" . -x '.*'
 	@echo "created $(PLUGIN_NAME).iinaplgz"
 
-## Run the daemon's Go test suite.
+## Run the pure plugin logic tests and the daemon's Go test suite.
 test:
+	npm run test:plugin
 	cd torrentd && CGO_ENABLED=0 go test ./...
 
 ## Remove all build artifacts.

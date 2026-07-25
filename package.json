@@ -1,11 +1,12 @@
 {
   "name": "iina-torrent-stream",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Stream torrents directly into IINA with seeking and buffering support",
   "license": "MIT",
   "private": true,
   "scripts": {
-    "build": "rm -rf dist && parcel build"
+    "build": "rm -rf dist && parcel build",
+    "test:plugin": "rm -rf .test-dist && tsc src/plugin-logic.ts --module commonjs --target es2020 --outDir .test-dist && node --test tests/plugin-logic.test.cjs"
   },
   "devDependencies": {
     "iina-plugin-definition": "^0.99.0",
